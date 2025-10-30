@@ -33,3 +33,6 @@ This example is for 2 2-way-join queries. Query 0 has a range filter [0, 49] and
 ```console
 env.java.opts: "-Doptimizer=FixedIntervalOptimizer -DrepeatedReconfiguration=true -DreconfInitialDelay=8000 -DreconfInterval=60000 -DDOPmax=16 -DDOPinIsolation=8 -DqueriesPerCategory="{\"2_way_join\":[0,1]}" -DreconfTargets="{\"2_way_join\":[\"statefuljoingid0\",\"statefuljoingid1\"]}" -DfiltersPerQuery="{\"0\":[0,49],\"1\":[0,99]}""
 ```
+
+## Application-level code and data generator
+Repository for the application-level code (queries) and the data-generator: [SPEGauge](https://github.com/michaelkoepf/SPEGauge)
