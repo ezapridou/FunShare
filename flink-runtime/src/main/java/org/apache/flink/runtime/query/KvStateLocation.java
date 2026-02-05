@@ -28,6 +28,7 @@ import org.apache.flink.util.Preconditions;
 import java.io.Serializable;
 import java.net.InetSocketAddress;
 import java.util.Arrays;
+import java.util.Iterator;
 
 /**
  * Location information for all key groups of a {@link InternalKvState} instance.
@@ -176,16 +177,18 @@ public class KvStateLocation implements Serializable {
             throw new IndexOutOfBoundsException("Key group index");
         }
 
-        for (int kgIdx = keyGroupRange.getStartKeyGroup();
-                kgIdx <= keyGroupRange.getEndKeyGroup();
-                ++kgIdx) {
-
+        int kgIdx = 0;
+        for (Iterator<Integer> keyGroupIterator = keyGroupRange.iterator();
+                keyGroupIterator.hasNext();) {
+            int keyGroup = keyGroupIterator.next();
             if (kvStateIds[kgIdx] == null && kvStateAddresses[kgIdx] == null) {
                 numRegisteredKeyGroups++;
             }
 
             kvStateIds[kgIdx] = kvStateId;
             kvStateAddresses[kgIdx] = kvStateAddress;
+
+            kgIdx++;
         }
     }
 
@@ -204,9 +207,10 @@ public class KvStateLocation implements Serializable {
             throw new IndexOutOfBoundsException("Key group index");
         }
 
-        for (int kgIdx = keyGroupRange.getStartKeyGroup();
-                kgIdx <= keyGroupRange.getEndKeyGroup();
-                ++kgIdx) {
+        int kgIdx = 0;
+        for (Iterator<Integer> keyGroupIterator = keyGroupRange.iterator();
+                keyGroupIterator.hasNext(); ) {
+            int keyGroup = keyGroupIterator.next();
             if (kvStateIds[kgIdx] == null || kvStateAddresses[kgIdx] == null) {
                 throw new IllegalArgumentException(
                         "Not registered. Probably registration/unregistration race.");
@@ -216,6 +220,8 @@ public class KvStateLocation implements Serializable {
 
             kvStateIds[kgIdx] = null;
             kvStateAddresses[kgIdx] = null;
+
+            ++kgIdx;
         }
     }
 

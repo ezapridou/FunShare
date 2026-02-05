@@ -85,5 +85,10 @@ public class KeyGroupPartitionedPriorityQueueTest extends InternalPriorityQueueT
         public void setInternalIndex(int newIndex) {
             internalIndex = newIndex;
         }
+
+        @Override
+        public String toStringCustom() {
+            return "";
+        }
     }
 }

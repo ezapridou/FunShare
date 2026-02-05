@@ -18,7 +18,10 @@
 
 package org.apache.flink.runtime.taskexecutor;
 
-import org.apache.flink.runtime.controller.ControlMessage;
+import net.michaelkoepf.spegauge.api.sut.DataDistrSplitStats;
+import net.michaelkoepf.spegauge.api.sut.ReconfigurableSourceData;
+
+import org.apache.flink.extensions.controller.ControlMessage;
 
 import org.apache.flink.api.common.JobID;
 import org.apache.flink.api.common.time.Time;
@@ -30,6 +33,7 @@ import org.apache.flink.runtime.clusterframework.types.ResourceID;
 import org.apache.flink.runtime.clusterframework.types.ResourceProfile;
 import org.apache.flink.runtime.clusterframework.types.SlotID;
 import org.apache.flink.runtime.concurrent.FutureUtils;
+import org.apache.flink.extensions.controller.TaskUtilizationStats;
 import org.apache.flink.runtime.deployment.TaskDeploymentDescriptor;
 import org.apache.flink.runtime.executiongraph.ExecutionAttemptID;
 import org.apache.flink.runtime.executiongraph.PartitionInfo;
@@ -44,6 +48,7 @@ import org.apache.flink.runtime.operators.coordination.OperatorEvent;
 import org.apache.flink.runtime.resourcemanager.ResourceManagerId;
 import org.apache.flink.runtime.rest.messages.LogInfo;
 import org.apache.flink.runtime.rest.messages.taskmanager.ThreadDumpInfo;
+import org.apache.flink.runtime.taskmanager.Task;
 import org.apache.flink.runtime.webmonitor.threadinfo.ThreadInfoSamplesRequest;
 import org.apache.flink.types.SerializableOptional;
 import org.apache.flink.util.Preconditions;
@@ -52,6 +57,9 @@ import org.apache.flink.util.function.TriConsumer;
 import org.apache.flink.util.function.TriFunction;
 
 import java.util.Collection;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.function.BiConsumer;
@@ -234,10 +242,30 @@ public class TestingTaskExecutorGateway implements TaskExecutorGateway {
     }
 
     @Override
-    public CompletableFuture<Acknowledge> sendControlToTask(
+    public CompletableFuture<?> sendControlToTask(
             ExecutionAttemptID executionAttemptID,
             Time timeout,
             ControlMessage controlMessage) {
+        return null;
+    }
+
+    @Override
+    public CompletableFuture<TaskUtilizationStats> sendMonitoringMsgToTask(
+            ExecutionAttemptID executionAttemptID, Time timeout) {
+        return null;
+    }
+
+    @Override
+    public CompletableFuture<Double> sendThroughputMonitoringMsgToTask(
+            ExecutionAttemptID executionAttemptID, Time timeout) {
+        return null;
+    }
+
+    @Override
+    public CompletableFuture<DataDistrSplitStats> sendSplitPhaseMonitoringMsgToTask(
+            ExecutionAttemptID executionAttemptID,
+            Time timeout
+    ) {
         return null;
     }
 
@@ -348,5 +376,35 @@ public class TestingTaskExecutorGateway implements TaskExecutorGateway {
     @Override
     public CompletableFuture<Collection<LogInfo>> requestLogList(Time timeout) {
         return FutureUtils.completedExceptionally(new UnsupportedOperationException());
+    }
+
+    @Override
+    public void sendSerializedState(
+            Map<Integer, Map<Integer, Map<Integer, byte[]>>> state,
+            Map<Integer, Map<Integer, HashMap<byte[], byte[]>>> newDedupMaps,
+            Map<Integer, List<byte[]>> newTriggers,
+            Map<Integer, Map<Integer, Map<Integer, byte[]>>> statePassiveQuery,
+            Map<Integer, String> stateNamesDict, int activeGroupId) {
+        // do nothing
+    }
+
+    @Override
+    public void sendSerializedStateDownstream(
+            Map<Integer, Map<String, byte[][]>> state,
+            Map<Integer, HashMap<byte[], byte[]>[]> deduplicationMaps,
+            Map<Integer, byte[][]> triggers,
+            Map<Integer, Integer> queueSizes, int activeGroupId) {
+        // do nothing
+    }
+
+    @Override
+    public void sendLastTupleData(
+            Map<Integer, ReconfigurableSourceData> lastTupleData, int activeGroupId) {
+        // do nothing
+    }
+
+    @Override
+    public void sendNewDriverInfo(String host, int port, int activeGroupId) {
+        // do nothing
     }
 }

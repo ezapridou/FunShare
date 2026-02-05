@@ -52,4 +52,11 @@ public interface ChannelSelector<T extends IOReadableWritable> {
      * @return true if the selector is for broadcast mode.
      */
     boolean isBroadcast();
+
+    /**
+     * Sets the number of output channels.
+     * Used for changing the partitioning during reconfiguration of the query plans
+     * @param numberOfChannels
+     */
+    void setNumberOfChannels(int numberOfChannels);
 }

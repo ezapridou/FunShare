@@ -18,7 +18,7 @@
 
 package org.apache.flink.streaming.runtime.io.checkpointing;
 
-import org.apache.flink.runtime.controller.ControlMessage;
+import org.apache.flink.extensions.controller.ControlMessage;
 
 import org.apache.flink.runtime.checkpoint.CheckpointException;
 import org.apache.flink.runtime.checkpoint.CheckpointFailureReason;
@@ -110,7 +110,7 @@ public abstract class CheckpointBarrierHandler implements Closeable {
 
     protected void notifyCheckpoint(CheckpointBarrier checkpointBarrier) throws IOException {
 
-        if(checkpointBarrier.getId() == ControlMessage.FixedEpochNumber()){
+        if(checkpointBarrier.getId() == ControlMessage.FixedEpochNumber){
             toNotifyOnCheckpoint.sendControl(checkpointBarrier.message);
             return;
         }

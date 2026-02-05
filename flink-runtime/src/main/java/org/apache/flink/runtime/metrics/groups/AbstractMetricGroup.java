@@ -141,6 +141,10 @@ public abstract class AbstractMetricGroup<A extends AbstractMetricGroup<?>> impl
                 excludedVariables.isEmpty() ? 0 : reporterIndex, excludedVariables);
     }
 
+    public Set<String> getMetricNames() {
+        return metrics.keySet();
+    }
+
     private Map<String, String> internalGetAllVariables(
             int cachingIndex, Set<String> excludedVariables) {
         if (variables[cachingIndex] == null) {

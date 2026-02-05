@@ -18,6 +18,8 @@
 
 package org.apache.flink.runtime.jobmaster;
 
+import net.michaelkoepf.spegauge.api.sut.ReconfigurableSourceData;
+
 import org.apache.flink.api.common.JobID;
 import org.apache.flink.api.common.JobStatus;
 import org.apache.flink.api.common.functions.AggregateFunction;
@@ -96,9 +98,11 @@ import javax.annotation.Nullable;
 
 import java.io.IOException;
 import java.net.InetSocketAddress;
+import java.util.ArrayList;
 import java.util.Collection;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
@@ -199,6 +203,73 @@ public class JobMaster extends PermanentlyFencedRpcEndpoint<JobMasterId>
             taskManagerHeartbeatManager;
 
     private HeartbeatManager<Void, Void> resourceManagerHeartbeatManager;
+
+    // -------- State migration ---------
+
+    private class ReconfData {
+        private final Map<ResourceID, Map<Integer, Map<Integer, Map<Integer, byte[]>>>> stateInTransit;
+        private final Map<ResourceID, Map<Integer, Map<Integer, Map<Integer, byte[]>>>> stateInTransitPassiveQuery;
+
+        private Map<Integer, String> stateNamesDict;
+
+        // TMid -> (partitionID -> (keyGroupId -> (dedupMap)))
+        private final Map<ResourceID, Map<Integer, Map<Integer, HashMap<byte[], byte[]>>>> dedupMapsInTransit;
+        // TMid -> (partitionID -> (triggers))
+        private final Map<ResourceID, Map<Integer, List<byte[]>>> triggersInTransit;
+
+        private int numOfSenderTMsTotal = 0; // total number of TaskManagers that must communicate with the JobMaster
+        private int currentNumOfSenderTMs = 0; // number of TaskManagers that have communicated with the JobMaster
+        private int currentNumOfSenderTMMessagesStateOnly = 0;
+        private int currentNumOfSenderTMsStatePassive = 0;
+        private int currentNumOfSenderTMsDedupMaps = 0;
+        private int currentNumOfSenderTMsTriggers = 0;
+
+        public ReconfData() {
+            // putting 15 as a reasonable number of max task managers
+            this.stateInTransit = new HashMap<>(15);
+            this.dedupMapsInTransit = new HashMap<>(15);
+            this.triggersInTransit = new HashMap<>(15);
+            this.stateInTransitPassiveQuery = new HashMap<>(15);
+            this.stateNamesDict = new HashMap<>(2);
+        }
+    }
+
+    private class ReconfDataDownstream {
+        private final Map<ResourceID, Map<Integer, Map<String, byte[][]>>> stateInTransitDownstream;
+        private final Map<ResourceID, Map<Integer, HashMap<byte[], byte[]>[]>> deduplicationMapsInTransitDownstream;
+        private final Map<ResourceID, Map<Integer, byte[][]>> triggersInTransitDownstream;
+        private final Map<ResourceID, Map<Integer, Integer>> queueSizesInTransitDownstream;
+        private int numOfSenderTMsDownstreamTotal = 0;
+        private int currentNumOfSenderTMsDownstream = 0;
+
+        public ReconfDataDownstream() {
+            this.stateInTransitDownstream = new HashMap<>(15);
+            this.deduplicationMapsInTransitDownstream = new HashMap<>(15);
+            this.triggersInTransitDownstream = new HashMap<>(15);
+            this.queueSizesInTransitDownstream = new HashMap<>(15);
+        }
+    }
+
+    private class ReconfDataSource {
+        private Map<Integer, ReconfigurableSourceData> lastTupleData;
+        private int numOfSenderTMsForLastTupleData = 0;
+        private int currentNumOfSenderTMsForLastTupleData = 0;
+        private Set<ResourceID> resourceIDsOfPassiveSources;
+
+        public ReconfDataSource() {
+            this.lastTupleData = new HashMap<>(16); // 16 is typically the number of sources we use
+            this.resourceIDsOfPassiveSources = new HashSet<>(15);
+        }
+    }
+
+    private final HashMap<Integer, ReconfData> reconfDataPerActiveGroup;
+    private final List<ReconfData> reconfDataPool;
+
+    private final HashMap<Integer, ReconfDataDownstream> reconfDataPerActiveGroupDownstream;
+    private final List<ReconfDataDownstream> reconfDataPoolDownstream;
+
+    private final HashMap<Integer, ReconfDataSource> reconfDataPerActiveGroupSource;
+    private final List<ReconfDataSource> reconfDataPoolSource;
 
     // ------------------------------------------------------------------------
 
@@ -328,6 +399,24 @@ public class JobMaster extends PermanentlyFencedRpcEndpoint<JobMasterId>
         this.establishedResourceManagerConnection = null;
 
         this.accumulators = new HashMap<>();
+
+        this.reconfDataPerActiveGroup = new HashMap<>(8);
+        this.reconfDataPool = new ArrayList<>(8);
+        for (int i = 0; i < 16; i++) {
+            this.reconfDataPool.add(new ReconfData());
+        }
+
+        this.reconfDataPerActiveGroupDownstream = new HashMap<>(8);
+        this.reconfDataPoolDownstream = new ArrayList<>(8);
+        for (int i = 0; i < 16; i++) {
+            this.reconfDataPoolDownstream.add(new ReconfDataDownstream());
+        }
+
+        this.reconfDataPerActiveGroupSource = new HashMap<>(8);
+        this.reconfDataPoolSource = new ArrayList<>(8);
+        for (int i = 0; i < 16; i++) {
+            this.reconfDataPoolSource.add(new ReconfDataSource());
+        }
     }
 
     private SchedulerNG createScheduler(
@@ -866,9 +955,436 @@ public class JobMaster extends PermanentlyFencedRpcEndpoint<JobMasterId>
         }
     }
 
+    @Override
+    public void sendStateToJobMaster(Map<ResourceID, Map<Integer, Map<Integer, Map<Integer, byte[]>>>> newState,
+                                     Map<ResourceID, Map<Integer, Map<Integer, HashMap<byte[], byte[]>>>> newDedupMaps,
+                                     Map<ResourceID, Map<Integer, List<byte[]>>> newTriggers,
+                                     Map<ResourceID, Map<Integer, Map<Integer, Map<Integer, byte[]>>>> statePassiveQuery,
+                                     Map<Integer, String> stateNames,
+                                     int numOfSenderTMs, int activeGroupId) {
+        ReconfData reconfData = getOrCreateReconfData(activeGroupId);
+        assert reconfData.numOfSenderTMsTotal == 0 || reconfData.numOfSenderTMsTotal == numOfSenderTMs;
+        reconfData.numOfSenderTMsTotal = numOfSenderTMs;
+
+        reconfData.currentNumOfSenderTMs++;
+
+        log.info("The JobMaster received state from the TaskManager: " + newState +
+                " " + reconfData.currentNumOfSenderTMs + " out of " + reconfData.numOfSenderTMsTotal
+                + " active-id " + activeGroupId);
+
+        if (reconfData.stateNamesDict.isEmpty()) {
+            reconfData.stateNamesDict = stateNames;
+        }
+
+        // aggregate the new state into stateInTransit
+        aggregateState(newState, reconfData.stateInTransit, stateNames, reconfData);
+
+        // aggregate the dedupMaps into dedupMapsInTransit
+        aggregateDedupMaps(newDedupMaps, reconfData);
+
+        // aggregate the triggers into triggersInTransit
+        aggregateTriggers(newTriggers, reconfData);
+
+        // aggregate the passive query state into stateInTransitPassiveQuery
+        aggregateState(statePassiveQuery, reconfData.stateInTransitPassiveQuery, stateNames, reconfData);
+
+        tryToSendStateToTaskManagers(activeGroupId);
+    }
+
+    @Override
+    public void sendStateOnlyToJobMaster(
+            Map<ResourceID, Map<Integer, Map<Integer, Map<Integer, byte[]>>>> newState,
+            Map<Integer, String> stateNames,
+            int numOfSenderTMs, int activeGroupId) {
+        ReconfData reconfData = getOrCreateReconfData(activeGroupId);
+        assert reconfData.numOfSenderTMsTotal == 0 || reconfData.numOfSenderTMsTotal == numOfSenderTMs;
+        reconfData.numOfSenderTMsTotal = numOfSenderTMs;
+
+        reconfData.currentNumOfSenderTMMessagesStateOnly++;
+
+        log.info("The JobMaster received state from the TaskManager: " + newState +
+                " " + reconfData.currentNumOfSenderTMMessagesStateOnly + " messages from "
+                + reconfData.numOfSenderTMsTotal + " TaskManagers" + " active-id " + activeGroupId);
+
+        if (reconfData.stateNamesDict.isEmpty()) {
+            reconfData.stateNamesDict = stateNames;
+        }
+
+        // aggregate the new state into stateInTransit
+        aggregateState(newState, reconfData.stateInTransit, stateNames, reconfData);
+
+        tryToSendStateToTaskManagers(activeGroupId);
+    }
+
+    @Override
+    public void sendDedupMapsToJobMaster(
+            Map<ResourceID, Map<Integer, Map<Integer, HashMap<byte[], byte[]>>>> newDedupMaps,
+            int numOfSenderTMs, int activeGroupId) {
+        ReconfData reconfData = getOrCreateReconfData(activeGroupId);
+        assert reconfData.numOfSenderTMsTotal == 0 || reconfData.numOfSenderTMsTotal == numOfSenderTMs;
+        reconfData.numOfSenderTMsTotal = numOfSenderTMs;
+
+        reconfData.currentNumOfSenderTMsDedupMaps++;
+
+        log.debug(GROUP_SHARE, "The JobMaster received dedupMaps from the TaskManager. " +
+                " " + reconfData.currentNumOfSenderTMsDedupMaps + " out of "
+                + reconfData.numOfSenderTMsTotal + " active-id " + activeGroupId);
+
+        // aggregate the dedupMaps into dedupMapsInTransit
+        aggregateDedupMaps(newDedupMaps, reconfData);
+
+        tryToSendStateToTaskManagers(activeGroupId);
+    }
+
+    @Override
+    public void sendTriggersToJobMaster(
+            Map<ResourceID, Map<Integer, List<byte[]>>> newTriggers,
+            int numOfSenderTMs, int activeGroupId) {
+        ReconfData reconfData = getOrCreateReconfData(activeGroupId);
+        assert reconfData.numOfSenderTMsTotal == 0 || reconfData.numOfSenderTMsTotal == numOfSenderTMs;
+        reconfData.numOfSenderTMsTotal = numOfSenderTMs;
+
+        reconfData.currentNumOfSenderTMsTriggers++;
+
+        log.debug(GROUP_SHARE, "The JobMaster received triggers from the TaskManager. " +
+                " " + reconfData.currentNumOfSenderTMsTriggers + " out of "
+                + reconfData.numOfSenderTMsTotal + " active-id " + activeGroupId);
+
+        // aggregate the triggers into dedupMapsInTransit
+        aggregateTriggers(newTriggers, reconfData);
+
+        tryToSendStateToTaskManagers(activeGroupId);
+    }
+
+    @Override
+    public void sendStatePassiveToJobMaster(
+            Map<ResourceID, Map<Integer, Map<Integer, Map<Integer, byte[]>>>> state,
+            Map<Integer, String> stateNames,
+            int numOfSenderTMs, int activeGroupId) {
+        ReconfData reconfData = getOrCreateReconfData(activeGroupId);
+        assert reconfData.numOfSenderTMsTotal == 0 || reconfData.numOfSenderTMsTotal == numOfSenderTMs;
+        reconfData.numOfSenderTMsTotal = numOfSenderTMs;
+
+        reconfData.currentNumOfSenderTMsStatePassive++;
+
+        log.debug(GROUP_SHARE, "The JobMaster received state passive from the TaskManager. " +
+                " " + reconfData.currentNumOfSenderTMsStatePassive + " out of "
+                + reconfData.numOfSenderTMsTotal + " active-id " + activeGroupId);
+
+        if (reconfData.stateNamesDict.isEmpty()) {
+            reconfData.stateNamesDict = stateNames;
+        }
+
+        // aggregate the triggers into dedupMapsInTransit
+        aggregateState(state, reconfData.stateInTransitPassiveQuery, stateNames, reconfData);
+
+        tryToSendStateToTaskManagers(activeGroupId);
+    }
+
+    @Override
+    public void sendStateToJobMasterDownstream(
+            Map<ResourceID, Map<Integer, Map<String, byte[][]>>> state,
+            Map<ResourceID, Map<Integer, HashMap<byte[], byte[]>[]>> deduplicationMaps,
+            Map<ResourceID, Map<Integer, byte[][]>> triggers,
+            Map<ResourceID, Map<Integer, Integer>> queueSizes,
+            int numOfSenderTMs, int activeGroupId) {
+        ReconfDataDownstream reconfData = getOrCreateReconfDataDownstream(activeGroupId);
+        log.debug(GROUP_SHARE, "The JobMaster received downstream state from the TaskManager"
+                + " active-id " + activeGroupId);
+
+        assert reconfData.numOfSenderTMsDownstreamTotal == 0
+                || reconfData.numOfSenderTMsDownstreamTotal == numOfSenderTMs;
+        reconfData.numOfSenderTMsDownstreamTotal = numOfSenderTMs;
+
+        reconfData.currentNumOfSenderTMsDownstream++;
+
+        // aggregate the new state into stateInTransitDownstream
+        for (Map.Entry<ResourceID, Map<Integer, Map<String, byte[][]>>> perResourceNewState :
+                state.entrySet()) {
+            Map<Integer, Map<String, byte[][]>> perResourceState = reconfData.stateInTransitDownstream
+                    .computeIfAbsent(perResourceNewState.getKey(), x -> new HashMap<>());
+            for (Map.Entry<Integer, Map<String, byte[][]>> perPartitionNewState :
+                    perResourceNewState.getValue().entrySet()) {
+                perResourceState.put(
+                        perPartitionNewState.getKey(),
+                        perPartitionNewState.getValue());
+            }
+        }
+
+        for (Map.Entry<ResourceID, Map<Integer, HashMap<byte[], byte[]>[]>> perResourceNewDedupMaps :
+                deduplicationMaps.entrySet()) {
+            Map<Integer, HashMap<byte[], byte[]>[]> perResourceDedupMaps = reconfData.deduplicationMapsInTransitDownstream
+                    .computeIfAbsent(perResourceNewDedupMaps.getKey(), x -> new HashMap<>());
+            for (Map.Entry<Integer, HashMap<byte[], byte[]>[]> perPartitionNewDedupMaps :
+                    perResourceNewDedupMaps.getValue().entrySet()) {
+                perResourceDedupMaps.put(
+                        perPartitionNewDedupMaps.getKey(),
+                        perPartitionNewDedupMaps.getValue());
+            }
+        }
+
+        for (Map.Entry<ResourceID, Map<Integer, byte[][]>> perResourceNewTriggers :
+                triggers.entrySet()) {
+            Map<Integer, byte[][]> perResourceTriggers = reconfData.triggersInTransitDownstream
+                    .computeIfAbsent(perResourceNewTriggers.getKey(), x -> new HashMap<>());
+            for (Map.Entry<Integer, byte[][]> perPartitionNewTriggers :
+                    perResourceNewTriggers.getValue().entrySet()) {
+                perResourceTriggers.put(
+                        perPartitionNewTriggers.getKey(),
+                        perPartitionNewTriggers.getValue());
+            }
+        }
+
+        for (Map.Entry<ResourceID, Map<Integer, Integer>> perResourceNewQueueSizes :
+                queueSizes.entrySet()) {
+            Map<Integer, Integer> perResourceQueueSizes = reconfData.queueSizesInTransitDownstream
+                    .computeIfAbsent(perResourceNewQueueSizes.getKey(), x -> new HashMap<>());
+            for (Map.Entry<Integer, Integer> perPartitionNewQueueSizes :
+                    perResourceNewQueueSizes.getValue().entrySet()) {
+                perResourceQueueSizes.put(
+                        perPartitionNewQueueSizes.getKey(),
+                        perPartitionNewQueueSizes.getValue());
+            }
+        }
+
+        tryToSendStateToTaskManagersDownstream(activeGroupId);
+    }
+
+    @Override
+    public void sendLastTupleDataToJobMaster(
+            Map<Integer, ReconfigurableSourceData> lastTupleData, int numOfSenderTMs,
+            ResourceID taskManagerId, int activeGroupId) {
+        ReconfDataSource reconfData = getOrCreateReconfDataSource(activeGroupId);
+        assert reconfData.numOfSenderTMsForLastTupleData == 0 ||
+                reconfData.numOfSenderTMsForLastTupleData == numOfSenderTMs;
+        reconfData.numOfSenderTMsForLastTupleData = numOfSenderTMs;
+        reconfData.currentNumOfSenderTMsForLastTupleData++;
+
+        log.debug(GROUP_SHARE, "The JobMaster received last tuple data from the TaskManager. "
+                + reconfData.currentNumOfSenderTMsForLastTupleData + " out of "
+                + reconfData.numOfSenderTMsForLastTupleData
+                + " TaskManagers have sent the data." + " active-id " + activeGroupId);
+
+        reconfData.lastTupleData.putAll(lastTupleData);
+        if (taskManagerId != null) {
+            reconfData.resourceIDsOfPassiveSources.add(taskManagerId);
+        }
+        tryToSendLastTupleDataToTaskManagers(activeGroupId);
+    }
+
+    @Override
+    public void sendNewDriverInfoAndResourceIDToJobMaster(
+            String hostOfNewDriver, int portOfNewDriver, Set<ResourceID> taskManagerIDs, int activeGroupId) {
+        log.debug(GROUP_SHARE, "The JobMaster received new driver info from the TaskManager." + " active-id " + activeGroupId);
+        for (ResourceID taskManagerID : taskManagerIDs) {
+            Tuple2<TaskManagerLocation, TaskExecutorGateway> taskManagerInfo = registeredTaskManagers.get(
+                    taskManagerID);
+            taskManagerInfo.f1.sendNewDriverInfo(hostOfNewDriver, portOfNewDriver, activeGroupId);
+        }
+    }
+
+
     // ----------------------------------------------------------------------------------------------
     // Internal methods
     // ----------------------------------------------------------------------------------------------
+
+    private void tryToSendStateToTaskManagers(int activeGroupId) {
+        ReconfData reconfData = reconfDataPerActiveGroup.get(activeGroupId);
+        //if (currentNumOfSenderTMs == numOfSenderTMsTotal) {
+        if (reconfData.currentNumOfSenderTMMessagesStateOnly/(4.0) ==reconfData. numOfSenderTMsTotal &&
+                reconfData.currentNumOfSenderTMsDedupMaps == reconfData.numOfSenderTMsTotal &&
+                reconfData.currentNumOfSenderTMsTriggers == reconfData.numOfSenderTMsTotal &&
+                reconfData.currentNumOfSenderTMsStatePassive == reconfData.numOfSenderTMsTotal) {
+            for (Map.Entry<ResourceID, Map<Integer, Map<Integer, Map<Integer, byte[]>>>> entry :
+                    reconfData.stateInTransit.entrySet()) {
+                ResourceID receiverTM = entry.getKey();
+                Map<Integer, Map<Integer, Map<Integer, byte[]>>> stateForTM = entry.getValue();
+                registeredTaskManagers.get(receiverTM).f1.sendSerializedState(
+                        stateForTM, reconfData.dedupMapsInTransit.get(receiverTM),
+                        reconfData.triggersInTransit.get(receiverTM), reconfData.stateInTransitPassiveQuery.get(receiverTM),
+                        reconfData.stateNamesDict, activeGroupId);
+                log.info("The JobMaster sent state to the TaskManager: " + receiverTM.getResourceIdString() + " active-id " + activeGroupId);
+            }
+            reconfData.stateInTransit.clear();
+            reconfData.dedupMapsInTransit.clear();
+            reconfData.triggersInTransit.clear();
+            reconfData.stateInTransitPassiveQuery.clear();
+            reconfData.stateNamesDict.clear();
+            // currentNumOfSenderTMs = 0;
+            reconfData.currentNumOfSenderTMMessagesStateOnly = 0;
+            reconfData.currentNumOfSenderTMsDedupMaps = 0;
+            reconfData.currentNumOfSenderTMsTriggers = 0;
+            reconfData.currentNumOfSenderTMsStatePassive = 0;
+            reconfData.numOfSenderTMsTotal = 0;
+            reconfDataPool.add(reconfDataPerActiveGroup.remove(activeGroupId));
+        }
+    }
+
+    private void tryToSendStateToTaskManagersDownstream(int activeGroupId) {
+        ReconfDataDownstream reconfData = reconfDataPerActiveGroupDownstream.get(activeGroupId);
+        if (reconfData.currentNumOfSenderTMsDownstream == reconfData.numOfSenderTMsDownstreamTotal) {
+            for (Map.Entry<ResourceID, Map<Integer, Map<String, byte[][]>>> entry :
+                    reconfData.stateInTransitDownstream.entrySet()) {
+                ResourceID receiverTM = entry.getKey();
+                Map<Integer, Map<String, byte[][]>> stateForTM = entry.getValue();
+                registeredTaskManagers.get(receiverTM).f1.sendSerializedStateDownstream(
+                        stateForTM, reconfData.deduplicationMapsInTransitDownstream.get(receiverTM),
+                        reconfData.triggersInTransitDownstream.get(receiverTM),
+                        reconfData.queueSizesInTransitDownstream.get(receiverTM), activeGroupId);
+                log.debug(GROUP_SHARE, "The JobMaster sent downstream state to the TaskManager: "
+                        + receiverTM.getResourceIdString() + " active-id " + activeGroupId);
+            }
+            reconfData.stateInTransitDownstream.clear();
+            reconfData.deduplicationMapsInTransitDownstream.clear();
+            reconfData.triggersInTransitDownstream.clear();
+            reconfData.queueSizesInTransitDownstream.clear();
+            reconfData.currentNumOfSenderTMsDownstream = 0;
+            reconfData.numOfSenderTMsDownstreamTotal = 0;
+            reconfDataPoolDownstream.add(reconfDataPerActiveGroupDownstream.remove(activeGroupId));
+        }
+    }
+
+    private void tryToSendLastTupleDataToTaskManagers(int activeGroupId) {
+        ReconfDataSource reconfData = reconfDataPerActiveGroupSource.get(activeGroupId);
+        if (reconfData.currentNumOfSenderTMsForLastTupleData == reconfData.numOfSenderTMsForLastTupleData) {
+            for (ResourceID taskManager : reconfData.resourceIDsOfPassiveSources) {
+                registeredTaskManagers.get(taskManager).f1.sendLastTupleData(reconfData.lastTupleData, activeGroupId);
+                log.debug(GROUP_SHARE, "The JobMaster sent last tuple data to the TaskManager: "
+                        + taskManager.getResourceIdString() + " active-id " + activeGroupId);
+            }
+            reconfData.lastTupleData.clear();
+            reconfData.resourceIDsOfPassiveSources.clear();
+            reconfData.numOfSenderTMsForLastTupleData = 0;
+            reconfData.currentNumOfSenderTMsForLastTupleData = 0;
+            reconfDataPoolSource.add(reconfDataPerActiveGroupSource.remove(activeGroupId));
+        }
+    }
+
+    private void aggregateState(Map<ResourceID, Map<Integer, Map<Integer, Map<Integer, byte[]>>>> newState,
+                                Map<ResourceID, Map<Integer, Map<Integer, Map<Integer, byte[]>>>> aggrState,
+                                Map<Integer, String> stateNamesDict, ReconfData reconfData) {
+        for (Map.Entry<ResourceID, Map<Integer, Map<Integer, Map<Integer, byte[]>>>> perResourceNewState :
+                newState.entrySet()) {
+            Map<Integer, Map<Integer, Map<Integer, byte[]>>> perResourceState = aggrState
+                    .computeIfAbsent(perResourceNewState.getKey(), x -> new HashMap<>());
+            for (Map.Entry<Integer, Map<Integer, Map<Integer, byte[]>>> perPartitionNewState :
+                    perResourceNewState.getValue().entrySet()){
+                Map<Integer, Map<Integer, byte[]>> perPartitionState = perResourceState
+                        .computeIfAbsent(perPartitionNewState.getKey(), x -> new HashMap<>());
+                for (Map.Entry<Integer, Map<Integer, byte[]>> perStateNameNewState :
+                        perPartitionNewState.getValue().entrySet()) {
+                    String stateName = stateNamesDict.get(perStateNameNewState.getKey());
+                    int stateId = getStateIdFromString(stateName, reconfData);
+                    Map<Integer, byte[]> perStateNameState = perPartitionState.computeIfAbsent(stateId, x -> new HashMap<>());
+                    for (Map.Entry<Integer, byte[]> perKeyGroupNewState : perStateNameNewState.getValue().entrySet()) {
+                        perStateNameState.put(perKeyGroupNewState.getKey(), perKeyGroupNewState.getValue());
+                    }
+                }
+            }
+        }
+    }
+
+    private int getStateIdFromString(String stateName, ReconfData reconfData) {
+        for (Map.Entry<Integer, String> entry : reconfData.stateNamesDict.entrySet()) {
+            if (entry.getValue().equals(stateName)) {
+                return entry.getKey();
+            }
+        }
+        throw new RuntimeException("State name not found in the state name dictionary");
+    }
+
+    private void aggregateDedupMaps(Map<ResourceID, Map<Integer,
+            Map<Integer, HashMap<byte[], byte[]>>>> newDedupMaps, ReconfData reconfData) {
+        for (Map.Entry<ResourceID, Map<Integer, Map<Integer, HashMap<byte[], byte[]>>>> perResourceNewDedupMaps :
+                newDedupMaps.entrySet()) {
+            Map<Integer, Map<Integer, HashMap<byte[], byte[]>>> perResourceDedupMaps = reconfData.dedupMapsInTransit
+                    .computeIfAbsent(perResourceNewDedupMaps.getKey(), x -> new HashMap<>());
+            for (Map.Entry<Integer, Map<Integer, HashMap<byte[], byte[]>>> perPartitionNewDedupMaps :
+                    perResourceNewDedupMaps.getValue().entrySet()) {
+                Map<Integer, HashMap<byte[], byte[]>> perPartitionDedupMaps = perResourceDedupMaps
+                        .computeIfAbsent(
+                                perPartitionNewDedupMaps.getKey(),
+                                x -> new HashMap<>());
+                perPartitionDedupMaps.putAll(perPartitionNewDedupMaps.getValue());
+            }
+        }
+    }
+
+    private void aggregateTriggers(Map<ResourceID, Map<Integer, List<byte[]>>> newTriggers, ReconfData reconfData) {
+        for (Map.Entry<ResourceID, Map<Integer, List<byte[]>>> perResourceNewTriggers :
+                newTriggers.entrySet()) {
+            Map<Integer, List<byte[]>> perResourceTriggers = reconfData.triggersInTransit
+                    .computeIfAbsent(perResourceNewTriggers.getKey(), x -> new HashMap<>());
+            for (Map.Entry<Integer, List<byte[]>> perPartitionNewTriggers :
+                    perResourceNewTriggers.getValue().entrySet()) {
+                List<byte[]> perPartitionTriggers = perResourceTriggers
+                        .computeIfAbsent(
+                                perPartitionNewTriggers.getKey(),
+                                x -> new ArrayList<>());
+                perPartitionTriggers.addAll(perPartitionNewTriggers.getValue());
+            }
+        }
+    }
+
+    private void increasePoolSize() {
+        for (int i = 0; i < 8; i++) {
+            reconfDataPool.add(new ReconfData());
+        }
+    }
+
+    private void increasePoolSizeDownstream() {
+        for (int i = 0; i < 8; i++) {
+            reconfDataPoolDownstream.add(new ReconfDataDownstream());
+        }
+    }
+
+    private void increasePoolSizeSource() {
+        for (int i = 0; i < 8; i++) {
+            reconfDataPoolSource.add(new ReconfDataSource());
+        }
+    }
+
+    private ReconfData getOrCreateReconfData(int activeGroupId) {
+        ReconfData reconfData;
+        if (reconfDataPerActiveGroup.containsKey(activeGroupId)) {
+            reconfData = reconfDataPerActiveGroup.get(activeGroupId);
+        } else {
+            if (reconfDataPool.size() == 0) {
+                increasePoolSize();
+            }
+            reconfData = reconfDataPool.remove(reconfDataPool.size() - 1);
+            reconfDataPerActiveGroup.put(activeGroupId, reconfData);
+        }
+        return reconfData;
+    }
+
+    private ReconfDataDownstream getOrCreateReconfDataDownstream(int activeGroupId) {
+        ReconfDataDownstream reconfData;
+        if (reconfDataPerActiveGroupDownstream.containsKey(activeGroupId)) {
+            reconfData = reconfDataPerActiveGroupDownstream.get(activeGroupId);
+        } else {
+            if (reconfDataPoolDownstream.size() == 0) {
+                increasePoolSizeDownstream();
+            }
+            reconfData = reconfDataPoolDownstream.remove(reconfDataPoolDownstream.size() - 1);
+            reconfDataPerActiveGroupDownstream.put(activeGroupId, reconfData);
+        }
+        return reconfData;
+    }
+
+    private ReconfDataSource getOrCreateReconfDataSource(int activeGroupId) {
+        ReconfDataSource reconfData;
+        if (reconfDataPerActiveGroupSource.containsKey(activeGroupId)) {
+            reconfData = reconfDataPerActiveGroupSource.get(activeGroupId);
+        } else {
+            if (reconfDataPoolSource.size() == 0) {
+                increasePoolSizeSource();
+            }
+            reconfData = reconfDataPoolSource.remove(reconfDataPoolSource.size() - 1);
+            reconfDataPerActiveGroupSource.put(activeGroupId, reconfData);
+        }
+        return reconfData;
+    }
 
     // -- job starting and stopping
     // -----------------------------------------------------------------

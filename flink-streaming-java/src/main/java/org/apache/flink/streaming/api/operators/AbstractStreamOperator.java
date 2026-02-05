@@ -654,4 +654,24 @@ public abstract class AbstractStreamOperator<OUT>
     protected Optional<InternalTimeServiceManager<?>> getTimeServiceManager() {
         return Optional.ofNullable(timeServiceManager);
     }
+
+    /**
+     * This method is used for debugging purposes.
+     */
+    public void printOutputClass(){
+        String msg = ("Operator " + getOperatorName() + " Output class: " + output.getClass().getName());
+        if (output instanceof CountingOutput) {
+            msg += (" - " + ((CountingOutput) output).getOutputClass());
+        }
+        LOG.info(msg);
+    }
+
+    public boolean hasForwardPartitioner() {
+        if (output instanceof CountingOutput) {
+            return ((CountingOutput) output).hasForwardPartitioner();
+        }
+        else {
+            return false;
+        }
+    }
 }

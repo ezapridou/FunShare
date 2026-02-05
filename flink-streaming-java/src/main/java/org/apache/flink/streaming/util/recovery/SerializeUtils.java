@@ -6,14 +6,13 @@ import com.twitter.chill.KryoInstantiator;
 import com.twitter.chill.KryoPool;
 
 import org.apache.flink.runtime.checkpoint.channel.InputChannelInfo;
-import org.apache.flink.runtime.controller.ControlMessage;
+import org.apache.flink.extensions.controller.ControlMessage;
 import org.apache.flink.runtime.executiongraph.ExecutionAttemptID;
 import org.apache.flink.runtime.jobgraph.IntermediateDataSetID;
 import org.apache.flink.runtime.jobgraph.IntermediateResultPartitionID;
 import org.apache.flink.util.AbstractID;
 
 import java.util.HashMap;
-import java.util.HashSet;
 
 public class SerializeUtils {
     private static KryoPool serializer;

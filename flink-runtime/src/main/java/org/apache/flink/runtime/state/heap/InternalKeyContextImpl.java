@@ -19,6 +19,7 @@
 package org.apache.flink.runtime.state.heap;
 
 import org.apache.flink.runtime.state.KeyGroupRange;
+import org.apache.flink.runtime.state.KeyGroupRangeAssignment;
 
 import javax.annotation.Nonnegative;
 import javax.annotation.Nonnull;
@@ -30,7 +31,7 @@ import javax.annotation.Nonnull;
  */
 public class InternalKeyContextImpl<K> implements InternalKeyContext<K> {
     /** Range of key-groups for which this backend is responsible. */
-    private final KeyGroupRange keyGroupRange;
+    private KeyGroupRange keyGroupRange;
     /** The number of key-groups aka max parallelism. */
     private final int numberOfKeyGroups;
 
@@ -73,5 +74,12 @@ public class InternalKeyContextImpl<K> implements InternalKeyContext<K> {
     @Override
     public void setCurrentKeyGroupIndex(int currentKeyGroupIndex) {
         this.currentKeyGroupIndex = currentKeyGroupIndex;
+    }
+
+    @Override
+    public void setKeyGroupRange(int parallelism, int operatorIndex) {
+        this.keyGroupRange =
+                KeyGroupRangeAssignment.computeKeyGroupRangeNonContinuousForOperatorIndex(
+                numberOfKeyGroups, parallelism, operatorIndex);
     }
 }

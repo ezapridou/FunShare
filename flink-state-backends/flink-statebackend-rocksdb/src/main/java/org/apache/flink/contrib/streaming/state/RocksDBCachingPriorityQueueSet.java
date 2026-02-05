@@ -306,6 +306,11 @@ public class RocksDBCachingPriorityQueueSet<E extends HeapPriorityQueueElement>
                 new RocksIteratorWrapper(db.newIterator(columnFamilyHandle, readOptions)));
     }
 
+    @Override
+    public String toStringCustom() {
+        return "";
+    }
+
     /** Ensures that recent writes are flushed and reflect in the RocksDB instance. */
     private void flushWriteBatch() {
         try {

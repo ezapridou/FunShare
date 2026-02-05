@@ -18,12 +18,15 @@
 
 package org.apache.flink.runtime.jobmanager.slots;
 
-import org.apache.flink.runtime.controller.ControlMessage;
+import net.michaelkoepf.spegauge.api.sut.DataDistrSplitStats;
+
+import org.apache.flink.extensions.controller.ControlMessage;
 
 import org.apache.flink.api.common.JobID;
 import org.apache.flink.api.common.time.Time;
 import org.apache.flink.runtime.checkpoint.CheckpointOptions;
 import org.apache.flink.runtime.clusterframework.types.AllocationID;
+import org.apache.flink.extensions.controller.TaskUtilizationStats;
 import org.apache.flink.runtime.deployment.TaskDeploymentDescriptor;
 import org.apache.flink.runtime.executiongraph.ExecutionAttemptID;
 import org.apache.flink.runtime.executiongraph.PartitionInfo;
@@ -64,7 +67,15 @@ public interface TaskManagerGateway extends TaskExecutorOperatorEventGateway {
      * @param timeout of the submit operation
      * @return Future acknowledge if the task is successfully canceled
      */
-    CompletableFuture<Acknowledge> sendControlToTask(ExecutionAttemptID executionAttemptID, Time timeout, ControlMessage controlMessage);
+    CompletableFuture<?> sendControlToTask(ExecutionAttemptID executionAttemptID, Time timeout, ControlMessage controlMessage);
+
+    CompletableFuture<TaskUtilizationStats> sendMonitoringMsgToTask(ExecutionAttemptID executionAttemptID, Time timeout);
+
+    CompletableFuture<Double> sendThroughputMonitoringMsgToTask(
+            ExecutionAttemptID executionAttemptID, Time timeout);
+
+    CompletableFuture<DataDistrSplitStats> sendSplitPhaseMonitoringMsgToTask(
+            ExecutionAttemptID executionAttemptID, Time timeout);
 
     CompletableFuture<Acknowledge> cancelTask(ExecutionAttemptID executionAttemptID, Time timeout);
 

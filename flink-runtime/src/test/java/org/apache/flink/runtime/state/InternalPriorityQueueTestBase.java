@@ -409,6 +409,11 @@ public abstract class InternalPriorityQueueTestBase extends TestLogger {
         public String toString() {
             return "TestElement{" + "key=" + key + ", priority=" + priority + '}';
         }
+
+        @Override
+        public String toStringCustom() {
+            return "";
+        }
     }
 
     /**

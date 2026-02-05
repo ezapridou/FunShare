@@ -18,6 +18,8 @@
 
 package org.apache.flink.runtime.jobmaster.utils;
 
+import net.michaelkoepf.spegauge.api.sut.ReconfigurableSourceData;
+
 import org.apache.flink.api.common.JobID;
 import org.apache.flink.api.common.JobStatus;
 import org.apache.flink.api.common.time.Time;
@@ -50,6 +52,7 @@ import org.apache.flink.runtime.resourcemanager.ResourceManagerId;
 import org.apache.flink.runtime.scheduler.ExecutionGraphInfo;
 import org.apache.flink.runtime.slots.ResourceRequirement;
 import org.apache.flink.runtime.state.KeyGroupRange;
+import org.apache.flink.runtime.state.heap.StateMap;
 import org.apache.flink.runtime.taskexecutor.TaskExecutorToJobManagerHeartbeatPayload;
 import org.apache.flink.runtime.taskexecutor.slot.SlotOffer;
 import org.apache.flink.runtime.taskmanager.TaskExecutionState;
@@ -63,6 +66,10 @@ import javax.annotation.Nullable;
 
 import java.net.InetSocketAddress;
 import java.util.Collection;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.function.BiConsumer;
 import java.util.function.BiFunction;
@@ -521,5 +528,66 @@ public class TestingJobMasterGateway implements JobMasterGateway {
             SerializedValue<CoordinationRequest> serializedRequest,
             Time timeout) {
         return deliverCoordinationRequestFunction.apply(operatorId, serializedRequest);
+    }
+
+    @Override
+    public void sendStateToJobMaster(Map<ResourceID, Map<Integer, Map<Integer, Map<Integer, byte[]>>>> newState,
+                                     Map<ResourceID, Map<Integer, Map<Integer, HashMap<byte[], byte[]>>>> newDedupMaps,
+                                     Map<ResourceID, Map<Integer, List<byte[]>>> newTriggers,
+                                     Map<ResourceID, Map<Integer, Map<Integer, Map<Integer, byte[]>>>> statePassiveQuery,
+                                     Map<Integer, String> stateNames,
+                                     int numOfSenderTMs, int activeGroupId) {
+        // do nothing
+    }
+
+    @Override
+    public void sendStateOnlyToJobMaster(
+            Map<ResourceID, Map<Integer, Map<Integer, Map<Integer, byte[]>>>> state,
+            Map<Integer, String> stateNames,
+            int numOfSenderTMs, int activeGroupId) {
+        // do nothing
+    }
+
+    @Override
+    public void sendDedupMapsToJobMaster(
+            Map<ResourceID, Map<Integer, Map<Integer, HashMap<byte[], byte[]>>>> deduplicationMaps,
+            int numOfSenderTMs, int activeGroupId) {
+        // do nothing
+    }
+
+    @Override
+    public void sendTriggersToJobMaster(
+            Map<ResourceID, Map<Integer, List<byte[]>>> triggers,
+            int numOfSenderTMs, int activeGroupId) {
+        // do nothing
+    }
+
+    @Override
+    public void sendStatePassiveToJobMaster(
+            Map<ResourceID, Map<Integer, Map<Integer, Map<Integer, byte[]>>>> state,
+            Map<Integer, String> stateNames,
+            int numOfSenderTMs, int activeGroupId) {
+        // do nothing
+    }
+
+    @Override
+    public void sendStateToJobMasterDownstream(Map<ResourceID, Map<Integer, Map<String, byte[][]>>> state,
+                                        Map<ResourceID, Map<Integer, HashMap<byte[], byte[]>[]>> deduplicationMaps,
+                                        Map<ResourceID, Map<Integer, byte[][]>> triggers,
+                                        Map<ResourceID, Map<Integer, Integer>> queueSizes,
+                                        int numOfSenderTMs, int activeGroupId) {
+        // do nothing
+    }
+
+    @Override
+    public void sendLastTupleDataToJobMaster(Map<Integer, ReconfigurableSourceData> lastTupleData,
+                                      int numOfSenderTMs, ResourceID taskManagerId, int activeGroupId) {
+        // do nothing
+    }
+
+    @Override
+    public void sendNewDriverInfoAndResourceIDToJobMaster(String hostOfNewDriver, int portOfNewDriver,
+                                                   Set<ResourceID> taskManagerIDs, int activeGroupId) {
+        // do nothing
     }
 }

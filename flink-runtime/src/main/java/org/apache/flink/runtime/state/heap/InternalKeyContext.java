@@ -59,4 +59,6 @@ public interface InternalKeyContext<K> {
      * @param currentKeyGroupIndex the current key group index to set to.
      */
     void setCurrentKeyGroupIndex(int currentKeyGroupIndex);
+
+    void setKeyGroupRange(int parallelism, int operatorIndex);
 }

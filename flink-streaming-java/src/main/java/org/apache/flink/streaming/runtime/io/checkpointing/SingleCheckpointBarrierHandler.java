@@ -18,7 +18,7 @@
 
 package org.apache.flink.streaming.runtime.io.checkpointing;
 
-import org.apache.flink.runtime.controller.ControlMessage;
+import org.apache.flink.extensions.controller.ControlMessage;
 
 import org.apache.flink.annotation.Internal;
 import org.apache.flink.annotation.VisibleForTesting;
@@ -36,6 +36,8 @@ import org.apache.flink.util.clock.Clock;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.slf4j.Marker;
+import org.slf4j.MarkerFactory;
 
 import javax.annotation.Nullable;
 import javax.annotation.concurrent.NotThreadSafe;
@@ -50,7 +52,6 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.BiFunction;
 
-import static org.apache.flink.runtime.checkpoint.CheckpointFailureReason.CHECKPOINT_DECLINED_INPUT_END_OF_STREAM;
 import static org.apache.flink.runtime.checkpoint.CheckpointFailureReason.CHECKPOINT_DECLINED_SUBSUMED;
 import static org.apache.flink.util.Preconditions.checkState;
 
@@ -66,6 +67,7 @@ import static org.apache.flink.util.Preconditions.checkState;
 public class SingleCheckpointBarrierHandler extends CheckpointBarrierHandler {
 
     private static final Logger LOG = LoggerFactory.getLogger(SingleCheckpointBarrierHandler.class);
+    private static final Marker GROUP_SHARE = MarkerFactory.getMarker("GroupShare");
 
     private final String taskName;
     private final ControllerImpl context;
@@ -216,8 +218,8 @@ public class SingleCheckpointBarrierHandler extends CheckpointBarrierHandler {
         long barrierId = barrier.getId();
         if(pendingBarrier == null && barrier.message != null){
             pendingBarrier = barrier;
-            numExpectedBarriers = getNumOfExpectedBarriers(barrier.message.MCS(), taskName);
-            System.out.println(taskName+" start aligning epoch markers! expected markers = "+numExpectedBarriers);
+            numExpectedBarriers = getNumOfExpectedBarriers(barrier.message.MCS, taskName);
+            LOG.debug(GROUP_SHARE, taskName + " start aligning epoch markers! expected markers = " + numExpectedBarriers);
         }
 
         LOG.debug("{}: Received barrier from channel {} @ {}. currentCheckpointId = {}, lastComplete = {}, lastTrue = {}, currentBarrier = {}, numOpenChannels = {}", taskName, channelInfo, barrierId,currentCheckpointId, lastCancelledOrCompletedCheckpointId, lastTrueCheckpointId, numBarriersReceived, numOpenChannels);
@@ -244,7 +246,7 @@ public class SingleCheckpointBarrierHandler extends CheckpointBarrierHandler {
 
         // we must mark alignment end before calling currentState.barrierReceived which might
         // trigger a checkpoint with unfinished future for alignment duration
-        if (numBarriersReceived == numOpenChannels || (currentCheckpointId == ControlMessage.FixedEpochNumber() && numBarriersReceived == numExpectedBarriers)) {
+        if (numBarriersReceived == numOpenChannels || (currentCheckpointId == ControlMessage.FixedEpochNumber && numBarriersReceived == numExpectedBarriers)) {
             if (getNumOpenChannels() > 1) {
                 markAlignmentEnd();
             }
@@ -258,14 +260,14 @@ public class SingleCheckpointBarrierHandler extends CheckpointBarrierHandler {
             ExceptionUtils.rethrowIOException(e);
         }
 
-        if ((currentCheckpointId != ControlMessage.FixedEpochNumber() && numBarriersReceived == numOpenChannels) ||
-                (currentCheckpointId == ControlMessage.FixedEpochNumber() && numBarriersReceived == numExpectedBarriers)) {
+        if ((currentCheckpointId != ControlMessage.FixedEpochNumber && numBarriersReceived == numOpenChannels) ||
+                (currentCheckpointId == ControlMessage.FixedEpochNumber && numBarriersReceived == numExpectedBarriers)) {
             numBarriersReceived = 0;
             lastCancelledOrCompletedCheckpointId = currentCheckpointId;
-            if(currentCheckpointId!= ControlMessage.FixedEpochNumber()) lastTrueCheckpointId = currentCheckpointId;
+            if(currentCheckpointId!= ControlMessage.FixedEpochNumber) lastTrueCheckpointId = currentCheckpointId;
             LOG.debug(
                     "{}: Received all barriers for checkpoint {}.", taskName, currentCheckpointId);
-            if(currentCheckpointId == ControlMessage.FixedEpochNumber()){
+            if(currentCheckpointId == ControlMessage.FixedEpochNumber){
                 currentCheckpointId = lastTrueCheckpointId;
                 lastCancelledOrCompletedCheckpointId = lastTrueCheckpointId;
             }
@@ -415,10 +417,10 @@ public class SingleCheckpointBarrierHandler extends CheckpointBarrierHandler {
         if (numBarriersReceived == numOpenChannels) {
             numBarriersReceived = 0;
             lastCancelledOrCompletedCheckpointId = currentCheckpointId;
-            if(currentCheckpointId!= ControlMessage.FixedEpochNumber()) lastTrueCheckpointId = currentCheckpointId;
+            if(currentCheckpointId!= ControlMessage.FixedEpochNumber) lastTrueCheckpointId = currentCheckpointId;
             LOG.debug(
                     "{}: Received all barriers for checkpoint {}.", taskName, currentCheckpointId);
-            if(currentCheckpointId == ControlMessage.FixedEpochNumber()){
+            if(currentCheckpointId == ControlMessage.FixedEpochNumber){
                 currentCheckpointId = lastTrueCheckpointId;
                 lastCancelledOrCompletedCheckpointId = lastTrueCheckpointId;
             }
@@ -457,7 +459,7 @@ public class SingleCheckpointBarrierHandler extends CheckpointBarrierHandler {
     }
 
     public CompletableFuture<Void> getAllBarriersReceivedFuture(long checkpointId) {
-        if(checkpointId != ControlMessage.FixedEpochNumber()){
+        if(checkpointId != ControlMessage.FixedEpochNumber){
             if (checkpointId < currentCheckpointId) {
                 return FutureUtils.completedVoidFuture();
             }
@@ -498,7 +500,7 @@ public class SingleCheckpointBarrierHandler extends CheckpointBarrierHandler {
 
         @Override
         public boolean allBarriersReceived() {
-            return numBarriersReceived == numOpenChannels ||  (currentCheckpointId == ControlMessage.FixedEpochNumber() && numBarriersReceived == numExpectedBarriers);
+            return numBarriersReceived == numOpenChannels ||  (currentCheckpointId == ControlMessage.FixedEpochNumber && numBarriersReceived == numExpectedBarriers);
         }
 
         @Override

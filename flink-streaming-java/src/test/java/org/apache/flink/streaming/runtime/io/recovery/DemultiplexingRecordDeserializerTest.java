@@ -275,5 +275,11 @@ public class DemultiplexingRecordDeserializerTest {
         public boolean isBroadcast() {
             return false;
         }
+
+        @Override
+        public void setNumberOfChannels(int numberOfChannels) {
+            throw new UnsupportedOperationException(""
+                    + "ModSelector does not support setNumberOfChannels");
+        }
     }
 }

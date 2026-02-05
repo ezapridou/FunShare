@@ -58,6 +58,8 @@ import org.apache.flink.util.SerializedValue;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.slf4j.Marker;
+import org.slf4j.MarkerFactory;
 
 import javax.annotation.Nullable;
 
@@ -93,6 +95,7 @@ public class OperatorChain<OUT, OP extends StreamOperator<OUT>>
         implements StreamStatusMaintainer, BoundedMultiInput {
 
     private static final Logger LOG = LoggerFactory.getLogger(OperatorChain.class);
+    private static final Marker GROUP_SHARE = MarkerFactory.getMarker("GroupShare");
 
     private final RecordWriterOutput<?>[] streamOutputs;
 
@@ -403,7 +406,7 @@ public class OperatorChain<OUT, OP extends StreamOperator<OUT>>
             availableOutputs.add(streamOutput.targetOperator);
             streamOutput.broadcastEvent(event, isPriorityEvent, targets);
         }
-        System.out.println("output edges: "+availableOutputs+" target edges: "+targets);
+        LOG.debug(GROUP_SHARE, "output edges: " + availableOutputs + " target edges: " + targets);
     }
 
     public void broadcastEvent(AbstractEvent event, boolean isPriorityEvent) throws IOException {

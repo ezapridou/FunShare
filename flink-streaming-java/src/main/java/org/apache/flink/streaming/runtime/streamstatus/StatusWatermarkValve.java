@@ -101,6 +101,8 @@ public class StatusWatermarkValve {
                     channelStatuses[channelIndex].isWatermarkAligned = true;
                 }
 
+                // GroupShare debug print for watermark receiving
+                // System.out.println(Thread.currentThread().getName()+" watermark min attempt "+ watermarkMillis );
                 // now, attempt to find a new min watermark across all aligned channels
                 findAndOutputNewMinWatermarkAcrossAlignedChannels(output);
             }
@@ -193,6 +195,8 @@ public class StatusWatermarkValve {
         // from some remaining aligned channel, and is also larger than the last output watermark
         if (hasAlignedChannels && newMinWatermark > lastOutputWatermark) {
             lastOutputWatermark = newMinWatermark;
+            // GroupShare debug print for watermark receiving
+            // System.out.println(Thread.currentThread().getName()+" watermark found "+ lastOutputWatermark );
             output.emitWatermark(new Watermark(lastOutputWatermark));
         }
     }

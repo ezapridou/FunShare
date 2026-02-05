@@ -127,6 +127,17 @@ public final class StreamMultipleInputProcessor implements StreamInputProcessor 
         return CompletableFuture.allOf(inputFutures);
     }
 
+    @Override
+    public String printClass() {
+        String res = "StreamMultipleInputProcessor: ";
+        if (inputProcessors != null) {
+            for (StreamOneInputProcessor<?> inputProcessor : inputProcessors) {
+                res += ", " + inputProcessor.printClass();
+            }
+        }
+        return res;
+    }
+
     private int selectNextReadingInputIndex() {
         if (!inputSelectionHandler.isAnyInputAvailable()) {
             fullCheckAndSetAvailable();

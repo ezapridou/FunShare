@@ -18,8 +18,18 @@
 
 package org.apache.flink.runtime.taskmanager;
 
-import org.apache.flink.runtime.executiongraph.ExecutionAttemptID;
+import net.michaelkoepf.spegauge.api.sut.ReconfigurableSourceData;
 
+import org.apache.flink.runtime.clusterframework.types.ResourceID;
+import org.apache.flink.runtime.executiongraph.ExecutionAttemptID;
+import org.apache.flink.runtime.state.StateEntry;
+import org.apache.flink.runtime.state.heap.HeapPriorityQueueElement;
+import org.apache.flink.runtime.state.heap.StateMap;
+
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
 import java.util.function.BiConsumer;
 import java.util.function.Consumer;
 
@@ -91,5 +101,97 @@ public class TestingTaskManagerActions implements TaskManagerActions {
             return new TestingTaskManagerActions(
                     notifyFatalErrorConsumer, failTaskConsumer, updateTaskExecutionStateConsumer);
         }
+    }
+
+    @Override
+    public void sendState(
+            int senderId, Map<Integer, Map<String, Map<Integer, StateMap<?, ?, ?>>>> state,
+            Map<ResourceID, Map<Integer, Map<Integer, Map<Integer, byte[]>>>> stateForOtherTMs,
+            int numOfSenders, int numOfReceivers, Map<Integer, String> stateNames,
+            boolean stateMigrationInvolvingMultipleTMs, int numOfSenderTMs, int activeGroupId) {
+        // do nothing
+    }
+
+    @Override
+    public void sendState(
+            int senderId, Map<Integer, Map<String, Map<Integer, StateMap<?, ?, ?>>>> state,
+            Map<ResourceID, Map<Integer, Map<Integer, Map<Integer, byte[]>>>> stateForOtherTMs,
+            Map<Integer, Map<Integer, HashMap<?, ?>>> deduplicationMaps,
+            Map<Integer, List<HeapPriorityQueueElement>> triggers,
+            Map<ResourceID, Map<Integer, Map<Integer, HashMap<byte[], byte[]>>>> deduplicationMapsForOtherTMs,
+            Map<ResourceID, Map<Integer, List<byte[]>>> triggersForOtherTMs,
+            int numOfSenders, int numOfReceivers, Map<Integer, String> stateNames,
+            boolean stateMigrationInvolvingMultipleTMs, int numOfSenderTMs, int activeGroupId) {
+        // do nothing
+    }
+
+    @Override
+    public void sendStatePassiveQuery(
+            int senderId,
+            Map<Integer, Map<String, Map<Integer, StateMap<?, ?, ?>>>> state,
+            Map<ResourceID, Map<Integer, Map<Integer, Map<Integer, byte[]>>>> stateForOtherTMs,
+            Map<Integer, String> stateNames,
+            int numOfSenders, int numOfReceivers, int activeGroupId) {
+        // do nothing
+    }
+
+    @Override
+    public void sendReceiverExecutionAttemptID(
+            int receiverId, ExecutionAttemptID executionAttemptID,
+            int numOfSenders, int numOfReceivers,
+            boolean stateMigrationInvolvingMultipleTMs, int numOfSenderTMs,
+            int activeGroupId) {
+        // do nothing
+    }
+
+    @Override
+    public void sendStateOfDownstream(
+            int senderId, Map<String, StateMap<?, ?, ?>[]> state,
+            Map<String, byte[][]> serializedState,
+            int numOfSenders, ResourceID receiverTMId,
+            boolean multipleTMsInvolvedInMigration,
+            int numOfSenderTMs, int activeGroupId) {
+        // do nothing
+    }
+
+    @Override
+    public void sendStateOfDownstream(
+            int senderId, Map<String, StateMap<?, ?, ?>[]> state,
+            Map<String, byte[][]> serializedState,
+            HashMap<?, ?>[] deduplicationMaps,
+            HashMap<byte[], byte[]>[] dedupMapsForOtherTMs,
+            HeapPriorityQueueElement[] triggers,
+            byte[][] triggersForOtherTMs, int queueSize,
+            int numOfSenders, ResourceID receiverTMId,
+            boolean multipleTMsInvolvedInMigration,
+            int numOfSenderTMs, int activeGroupId) {
+        // do nothing
+    }
+
+    @Override
+    public void sendDownstreamReceiverExecutionAttemptID(
+            int receiverId, ExecutionAttemptID executionAttemptID, int numOfReceivers, int activeGroupId) {
+        // do nothing
+    }
+
+    @Override
+    public void sendLastTupleData(
+            int senderId, ReconfigurableSourceData tupleData,
+            int numOfSources, int numOfTMs, int activeGroupId) {
+        // do nothing
+    }
+
+    @Override
+    public void sendSourceTaskExecutionAttemptID(
+            int taskId, ExecutionAttemptID executionAttemptID,
+            int numOfSources, int numOfTMs, ResourceID taskManagerID, int activeGroupId) {
+        // do nothing
+    }
+
+    @Override
+    public void sendDriverJobIDAndHostname(
+            String driverJobID, String hostname, String driverPort,
+            Set<ResourceID> taskManagerIDsPassiveQuery, int activeGroupId) {
+        // do nothing
     }
 }

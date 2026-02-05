@@ -33,7 +33,14 @@ import org.apache.flink.api.common.state.State;
 import org.apache.flink.api.common.state.StateDescriptor;
 import org.apache.flink.api.common.state.ValueState;
 import org.apache.flink.api.common.state.ValueStateDescriptor;
+import org.apache.flink.runtime.clusterframework.types.ResourceID;
+import org.apache.flink.runtime.state.heap.HeapKeyedStateBackend;
+import org.apache.flink.runtime.state.heap.StateMap;
 import org.apache.flink.util.Preconditions;
+
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
 
 import static java.util.Objects.requireNonNull;
 
@@ -114,5 +121,118 @@ public class DefaultKeyedStateStore implements KeyedStateStore {
             throws Exception {
         return keyedStateBackend.getPartitionedState(
                 VoidNamespace.INSTANCE, VoidNamespaceSerializer.INSTANCE, stateDescriptor);
+    }
+
+    public void printState(String taskName) {
+        if (keyedStateBackend instanceof HeapKeyedStateBackend) {
+            ((HeapKeyedStateBackend) keyedStateBackend).printState(taskName);
+        }
+        else{
+            throw new UnsupportedOperationException("The keyedStateBackend is not HeapKeyedStateBackend");
+        }
+    }
+
+    public Map<Integer, Map<String, Map<Integer, StateMap<?, ?, ?>>>> getEntriesForMigration(
+            int newDOP, int taskIndex, int maxParallelism,
+            Map<Integer, ResourceID> partitionToResourceIDMap,
+            Map<ResourceID, Map<Integer, Map<Integer, Map<Integer, byte[]>>>> stateForOtherTMs,
+            Map<Integer, String> stateNameDict, List<Integer> partitionIdToTaskId){
+        if (keyedStateBackend instanceof HeapKeyedStateBackend) {
+            return ((HeapKeyedStateBackend) keyedStateBackend).getEntriesForMigration(
+                    newDOP, taskIndex, maxParallelism, partitionToResourceIDMap, stateForOtherTMs,
+                    stateNameDict, partitionIdToTaskId);
+        }
+        else{
+            throw new UnsupportedOperationException("The keyedStateBackend is not HeapKeyedStateBackend");
+        }
+    }
+
+    public Map<Integer, Map<String, Map<Integer, StateMap<?, ?, ?>>>> getEntireStateForMigration(
+            int newDOP, int taskIndex, int maxParallelism,
+            Map<Integer, ResourceID> partitionToResourceIDMapActive,
+            Map<Integer, ResourceID> partitionToResourceIDMapPassive,
+            Map<ResourceID, Map<Integer, Map<Integer, Map<Integer, byte[]>>>> stateForOtherTMs,
+            Map<Integer, String> stateNameDict, List<Integer> partitionIdToTaskId){
+        if (keyedStateBackend instanceof HeapKeyedStateBackend) {
+            return ((HeapKeyedStateBackend) keyedStateBackend).getEntireStateForMigration(
+                    newDOP, taskIndex, maxParallelism, partitionToResourceIDMapActive,
+                    partitionToResourceIDMapPassive, stateForOtherTMs, stateNameDict, partitionIdToTaskId);
+        }
+        else{
+            throw new UnsupportedOperationException("The keyedStateBackend is not HeapKeyedStateBackend");
+        }
+    }
+
+    public Map<Integer, Map<String, Map<Integer, StateMap<?, ?, ?>>>> getEntriesInRangeForMigration(
+            int newDOP, int taskIndex, int maxParallelism, long start, long end, long start2, long end2,
+            Map<Integer, ResourceID> partitionToResourceIDMapActive,
+            Map<Integer, ResourceID> partitionToResourceIDMapPassive,
+            Map<ResourceID, Map<Integer, Map<Integer, Map<Integer, byte[]>>>> stateForOtherTMs,
+            Map<Integer, String> stateNameDict, List<Integer> partitionIdToTaskId) {
+        if (keyedStateBackend instanceof HeapKeyedStateBackend) {
+            return ((HeapKeyedStateBackend) keyedStateBackend).getEntriesInRangeForMigration(
+                    newDOP, taskIndex, maxParallelism, start, end, start2, end2,
+                    partitionToResourceIDMapActive, partitionToResourceIDMapPassive, stateForOtherTMs,
+                    stateNameDict, partitionIdToTaskId);
+        }
+        else{
+            throw new UnsupportedOperationException("The keyedStateBackend is not HeapKeyedStateBackend");
+        }
+    }
+
+    public Map<String, StateMap<?, ?, ?>[]> getEntriesForMigrationDownstream(
+            boolean stateMustBeSerialized, Map<String, byte[][]> stateForOtherTM
+            ) {
+        if (keyedStateBackend instanceof HeapKeyedStateBackend) {
+            return ((HeapKeyedStateBackend) keyedStateBackend).getEntriesForMigrationDownstream(
+                    stateMustBeSerialized, stateForOtherTM);
+        }
+        else{
+            throw new UnsupportedOperationException("The keyedStateBackend is not HeapKeyedStateBackend");
+        }
+    }
+
+    public void incorporateReceivedState(Map<String, Map<Integer, StateMap<?, ?, ?>>> newStateMaps,
+                                         Map<String, Map<Integer, StateMap<?, ?, ?>>> newStateMapsPassiveQuery,
+                                         int newDOP,
+                                         int operatorIndex) {
+        if (keyedStateBackend instanceof HeapKeyedStateBackend) {
+            ((HeapKeyedStateBackend) keyedStateBackend).incorporateReceivedState(
+                    newStateMaps, newStateMapsPassiveQuery, newDOP, operatorIndex);
+        }
+        else{
+            throw new UnsupportedOperationException("The keyedStateBackend is not HeapKeyedStateBackend");
+        }
+    }
+
+    public void incorporateReceivedState(Map<String, StateMap<?, ?, ?>[]> newStateMaps) {
+        if (keyedStateBackend instanceof HeapKeyedStateBackend) {
+            ((HeapKeyedStateBackend) keyedStateBackend).incorporateReceivedState(newStateMaps);
+        }
+        else{
+            throw new UnsupportedOperationException("The keyedStateBackend is not HeapKeyedStateBackend");
+        }
+    }
+
+    public void incorporateReceivedSerializedState(
+            Map<Integer, Map<Integer, byte[]>> newState,
+            Map<Integer, Map<Integer, byte[]>> statePassiveQuery,
+            Map<Integer, String> stateNameDict) {
+        if (keyedStateBackend instanceof HeapKeyedStateBackend) {
+            ((HeapKeyedStateBackend) keyedStateBackend).incorporateReceivedSerializedState(
+                    newState, statePassiveQuery, stateNameDict);
+        }
+        else{
+            throw new UnsupportedOperationException("The keyedStateBackend is not HeapKeyedStateBackend");
+        }
+    }
+
+    public void incorporateReceivedSerializedStateDownstream(Map<String, byte[][]> newState) {
+        if (keyedStateBackend instanceof HeapKeyedStateBackend) {
+            ((HeapKeyedStateBackend) keyedStateBackend).incorporateReceivedSerializedStateDownstream(newState);
+        }
+        else{
+            throw new UnsupportedOperationException("The keyedStateBackend is not HeapKeyedStateBackend");
+        }
     }
 }

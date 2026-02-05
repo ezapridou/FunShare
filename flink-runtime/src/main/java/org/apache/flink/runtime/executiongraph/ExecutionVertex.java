@@ -18,7 +18,9 @@
 
 package org.apache.flink.runtime.executiongraph;
 
-import org.apache.flink.runtime.controller.ControlMessage;
+import net.michaelkoepf.spegauge.api.sut.DataDistrSplitStats;
+
+import org.apache.flink.extensions.controller.ControlMessage;
 
 import org.apache.flink.annotation.VisibleForTesting;
 import org.apache.flink.api.common.Archiveable;
@@ -29,12 +31,13 @@ import org.apache.flink.core.io.InputSplitAssigner;
 import org.apache.flink.runtime.JobException;
 import org.apache.flink.runtime.clusterframework.types.AllocationID;
 import org.apache.flink.runtime.clusterframework.types.ResourceProfile;
+import org.apache.flink.extensions.controller.TaskUtilizationStats;
 import org.apache.flink.runtime.execution.ExecutionState;
 import org.apache.flink.runtime.io.network.partition.ResultPartitionID;
 import org.apache.flink.runtime.jobgraph.IntermediateResultPartitionID;
 import org.apache.flink.runtime.jobgraph.JobVertexID;
 import org.apache.flink.runtime.jobmaster.LogicalSlot;
-import org.apache.flink.runtime.messages.Acknowledge;
+import org.apache.flink.extensions.reconfiguration.ReconfigurableExecutionVertex;
 import org.apache.flink.runtime.scheduler.strategy.ConsumedPartitionGroup;
 import org.apache.flink.runtime.scheduler.strategy.ExecutionVertexID;
 import org.apache.flink.runtime.taskmanager.TaskManagerLocation;
@@ -62,7 +65,7 @@ import static org.apache.flink.util.Preconditions.checkState;
  * times, each of which time it spawns an {@link Execution}.
  */
 public class ExecutionVertex
-        implements AccessExecutionVertex, Archiveable<ArchivedExecutionVertex> {
+        implements AccessExecutionVertex, Archiveable<ArchivedExecutionVertex>, ReconfigurableExecutionVertex {
 
     private static final Logger LOG = DefaultExecutionGraph.LOG;
 
@@ -462,6 +465,21 @@ public class ExecutionVertex
     public CompletableFuture<?> sendControlMessage(ControlMessage message){
         final Execution exec = currentExecution;
         return exec.sendControlRPCCall(message);
+    }
+
+    public CompletableFuture<TaskUtilizationStats> sendMonitoringMessage(){
+        final Execution exec = currentExecution;
+        return exec.sendMonitoringRPCCall();
+    }
+
+    public CompletableFuture<Double> sendThroughputMonitoringMessage(){
+        final Execution exec = currentExecution;
+        return exec.sendThroughputMonitoringRPCCall();
+    }
+
+    public CompletableFuture<DataDistrSplitStats> sendSplitPhaseMonitoringMessage(){
+        final Execution exec = currentExecution;
+        return exec.sendSplitPhaseMonitoringRPCCall();
     }
 
     public CompletableFuture<?> pause(){

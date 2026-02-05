@@ -18,7 +18,10 @@
 
 package org.apache.flink.runtime.taskexecutor;
 
-import org.apache.flink.runtime.controller.ControlMessage;
+import net.michaelkoepf.spegauge.api.sut.DataDistrSplitStats;
+import net.michaelkoepf.spegauge.api.sut.ReconfigurableSourceData;
+
+import org.apache.flink.extensions.controller.ControlMessage;
 
 import org.apache.flink.api.common.JobID;
 import org.apache.flink.api.common.time.Time;
@@ -29,6 +32,7 @@ import org.apache.flink.runtime.clusterframework.types.AllocationID;
 import org.apache.flink.runtime.clusterframework.types.ResourceID;
 import org.apache.flink.runtime.clusterframework.types.ResourceProfile;
 import org.apache.flink.runtime.clusterframework.types.SlotID;
+import org.apache.flink.extensions.controller.TaskUtilizationStats;
 import org.apache.flink.runtime.deployment.TaskDeploymentDescriptor;
 import org.apache.flink.runtime.executiongraph.ExecutionAttemptID;
 import org.apache.flink.runtime.executiongraph.PartitionInfo;
@@ -49,6 +53,9 @@ import org.apache.flink.types.SerializableOptional;
 import org.apache.flink.util.SerializedValue;
 
 import java.util.Collection;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 
@@ -164,6 +171,15 @@ public interface TaskExecutorGateway
     CompletableFuture<Acknowledge> abortCheckpoint(
             ExecutionAttemptID executionAttemptID, long checkpointId, long checkpointTimestamp);
 
+    CompletableFuture<?> sendControlToTask(
+            ExecutionAttemptID executionAttemptID, @RpcTimeout Time timeout, ControlMessage controlMessage);
+
+    CompletableFuture<TaskUtilizationStats> sendMonitoringMsgToTask(ExecutionAttemptID executionAttemptID, @RpcTimeout Time timeout);
+
+    CompletableFuture<Double> sendThroughputMonitoringMsgToTask(ExecutionAttemptID executionAttemptID, @RpcTimeout Time timeout);
+
+    CompletableFuture<DataDistrSplitStats> sendSplitPhaseMonitoringMsgToTask(ExecutionAttemptID executionAttemptID, @RpcTimeout Time timeout);
+
     /**
      * Cancel the given task.
      *
@@ -171,10 +187,6 @@ public interface TaskExecutorGateway
      * @param timeout for the cancel operation
      * @return Future acknowledge if the task is successfully canceled
      */
-    CompletableFuture<Acknowledge> sendControlToTask(
-            ExecutionAttemptID executionAttemptID, @RpcTimeout Time timeout, ControlMessage controlMessage);
-
-
     CompletableFuture<Acknowledge> cancelTask(
             ExecutionAttemptID executionAttemptID, @RpcTimeout Time timeout);
 
@@ -288,4 +300,24 @@ public interface TaskExecutorGateway
      * @return the {@link ThreadDumpInfo} for this TaskManager.
      */
     CompletableFuture<ThreadDumpInfo> requestThreadDump(@RpcTimeout Time timeout);
+
+    /**
+     * Sends state to the TaskExecutor for state migration.
+     */
+    void sendSerializedState(
+            Map<Integer, Map<Integer, Map<Integer, byte[]>>> state,
+            Map<Integer, Map<Integer, HashMap<byte[], byte[]>>> newDedupMaps,
+            Map<Integer, List<byte[]>> newTriggers,
+            Map<Integer, Map<Integer, Map<Integer, byte[]>>> statePassiveQuery,
+            Map<Integer, String> stateNamesDict, int activeGroupId);
+
+    void sendSerializedStateDownstream(
+            Map<Integer, Map<String, byte[][]>> state,
+            Map<Integer, HashMap<byte[], byte[]>[]> deduplicationMaps,
+            Map<Integer, byte[][]> triggers,
+            Map<Integer, Integer> queueSizes, int activeGroupId);
+
+    void sendLastTupleData(Map<Integer, ReconfigurableSourceData> lastTupleData, int activeGroupId);
+
+    void sendNewDriverInfo(String host, int port, int activeGroupId);
 }

@@ -131,4 +131,20 @@ public final class TimerHeapInternalTimer<K, N>
     public int comparePriorityTo(@Nonnull InternalTimer<?, ?> other) {
         return Long.compare(timestamp, other.getTimestamp());
     }
+
+    @Override
+    public String toStringCustom() {
+        return "TimerHeapInternalTimer{"
+                + "key="
+                + key
+                + " of type " + key.getClass().getName()
+                + ", namespace="
+                + namespace
+                + " of type " + namespace.getClass().getName()
+                + ", timestamp="
+                + timestamp
+                + ", timerHeapIndex="
+                + timerHeapIndex
+                + '}';
+    }
 }

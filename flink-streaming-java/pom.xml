@@ -36,6 +36,16 @@ under the License.
 
 	<dependencies>
 
+
+		<!-- custom dependencies -->
+		<!-- optimizer (avoid recompilation) of entire flink project -->
+		<dependency>
+			<groupId>org.apache.flink</groupId>
+			<artifactId>flink-extensions_${scala.binary.version}</artifactId>
+			<version>${project.version}</version>
+			<scope>provided</scope>
+		</dependency>
+
 		<!-- core dependencies -->
 
 		<dependency>
@@ -77,6 +87,15 @@ under the License.
 			<groupId>org.apache.commons</groupId>
 			<artifactId>commons-math3</artifactId>
 			<version>3.5</version>
+		</dependency>
+
+		<!-- Dependency for the SPEGauge API -->
+		<dependency>
+			<groupId>net.michaelkoepf</groupId>
+			<artifactId>spegauge-api</artifactId>
+			<version>0.1.0-SNAPSHOT</version>
+			<scope>system</scope>
+			<systemPath>${project.basedir}/../resources/spegauge-api-0.1.0-SNAPSHOT.jar</systemPath>
 		</dependency>
 
 		<!-- test dependencies -->

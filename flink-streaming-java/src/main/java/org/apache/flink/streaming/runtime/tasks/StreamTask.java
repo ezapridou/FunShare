@@ -17,15 +17,28 @@
 
 package org.apache.flink.streaming.runtime.tasks;
 
-import org.apache.flink.runtime.controller.ControlMessage;
+import net.michaelkoepf.spegauge.api.sut.DataDistrSplitStats;
+import net.michaelkoepf.spegauge.api.sut.FilterDataDistrMergeStats;
+import net.michaelkoepf.spegauge.api.sut.JoinDataDistrMergeStats;
+import net.michaelkoepf.spegauge.api.sut.JoinMonitor;
+import net.michaelkoepf.spegauge.api.sut.QuerySetAssigner;
+import net.michaelkoepf.spegauge.api.sut.ReconfigurableSourceData;
+
+import net.michaelkoepf.spegauge.api.sut.SelectivitiesMonitor;
 
 import org.apache.flink.annotation.Internal;
 import org.apache.flink.annotation.VisibleForTesting;
 import org.apache.flink.api.common.TaskInfo;
+import org.apache.flink.api.common.typeutils.TypeSerializer;
 import org.apache.flink.configuration.TaskManagerOptions;
 import org.apache.flink.core.fs.CloseableRegistry;
 import org.apache.flink.core.fs.Path;
 import org.apache.flink.core.io.InputStatus;
+import org.apache.flink.core.memory.ByteArrayOutputStreamWithPos;
+import org.apache.flink.core.memory.DataOutputView;
+import org.apache.flink.core.memory.DataOutputViewStreamWrapper;
+import org.apache.flink.extensions.controller.StartMonitoringDataDistrControlMessage;
+import org.apache.flink.extensions.controller.StopMonitoringDataDistrControlMessage;
 import org.apache.flink.metrics.Counter;
 import org.apache.flink.metrics.SimpleCounter;
 import org.apache.flink.runtime.checkpoint.CheckpointException;
@@ -35,7 +48,12 @@ import org.apache.flink.runtime.checkpoint.CheckpointMetricsBuilder;
 import org.apache.flink.runtime.checkpoint.CheckpointOptions;
 import org.apache.flink.runtime.checkpoint.channel.ChannelStateWriter;
 import org.apache.flink.runtime.checkpoint.channel.SequentialChannelStateReader;
+import org.apache.flink.runtime.clusterframework.types.ResourceID;
 import org.apache.flink.runtime.concurrent.FutureUtils;
+import org.apache.flink.extensions.controller.ControlMessage;
+import org.apache.flink.extensions.controller.MIGRATION_TYPE_FROM_PASSIVE_QUERY;
+import org.apache.flink.extensions.controller.ReconfigurationControlMessage;
+import org.apache.flink.extensions.controller.TaskUtilizationStats;
 import org.apache.flink.runtime.execution.CancelTaskException;
 import org.apache.flink.runtime.execution.Environment;
 import org.apache.flink.runtime.io.network.api.CancelCheckpointMarker;
@@ -64,21 +82,34 @@ import org.apache.flink.runtime.state.CheckpointStorageLoader;
 import org.apache.flink.runtime.state.CheckpointStorageWorkerView;
 import org.apache.flink.runtime.state.StateBackend;
 import org.apache.flink.runtime.state.StateBackendLoader;
+import org.apache.flink.runtime.state.heap.HeapPriorityQueueElement;
+import org.apache.flink.runtime.state.heap.StateMap;
 import org.apache.flink.runtime.state.ttl.TtlTimeProvider;
 import org.apache.flink.runtime.taskmanager.DispatcherThreadFactory;
+import org.apache.flink.runtime.taskmanager.TaskManagerActions;
 import org.apache.flink.runtime.util.ExecutorThreadFactory;
 import org.apache.flink.runtime.util.FatalExitExceptionHandler;
 import org.apache.flink.streaming.api.TimeCharacteristic;
+import org.apache.flink.streaming.api.functions.co.KeyedCoProcessFunction;
+import org.apache.flink.streaming.api.functions.source.RichParallelSourceFunction;
 import org.apache.flink.streaming.api.graph.StreamConfig;
 import org.apache.flink.streaming.api.graph.StreamEdge;
+import org.apache.flink.streaming.api.operators.AbstractStreamOperator;
+import org.apache.flink.streaming.api.operators.AbstractUdfStreamOperator;
 import org.apache.flink.streaming.api.operators.InternalTimeServiceManager;
 import org.apache.flink.streaming.api.operators.InternalTimeServiceManagerImpl;
+import org.apache.flink.streaming.api.operators.InternalTimerServiceImpl;
 import org.apache.flink.streaming.api.operators.MailboxExecutor;
 import org.apache.flink.streaming.api.operators.StreamOperator;
 import org.apache.flink.streaming.api.operators.StreamTaskStateInitializer;
 import org.apache.flink.streaming.api.operators.StreamTaskStateInitializerImpl;
+import org.apache.flink.streaming.api.operators.TimerHeapInternalTimer;
+import org.apache.flink.streaming.api.operators.co.KeyedCoProcessOperator;
 import org.apache.flink.streaming.runtime.io.RecordWriterOutput;
 import org.apache.flink.streaming.runtime.io.StreamInputProcessor;
+import org.apache.flink.streaming.runtime.io.StreamOneInputProcessor;
+import org.apache.flink.streaming.runtime.io.StreamTwoInputProcessor;
+import org.apache.flink.streaming.runtime.operators.windowing.WindowOperator;
 import org.apache.flink.streaming.runtime.partitioner.ConfigurableStreamPartitioner;
 import org.apache.flink.streaming.runtime.partitioner.StreamPartitioner;
 import org.apache.flink.streaming.runtime.streamrecord.StreamRecord;
@@ -92,6 +123,7 @@ import org.apache.flink.streaming.runtime.tasks.mailbox.TaskMailboxImpl;
 import org.apache.flink.util.ExceptionUtils;
 import org.apache.flink.util.FlinkException;
 import org.apache.flink.util.InstantiationUtil;
+import org.apache.flink.util.MathUtils;
 import org.apache.flink.util.Preconditions;
 import org.apache.flink.util.SerializedValue;
 import org.apache.flink.util.function.RunnableWithException;
@@ -99,13 +131,14 @@ import org.apache.flink.util.function.ThrowingRunnable;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.slf4j.Marker;
+import org.slf4j.MarkerFactory;
 
 import javax.annotation.Nullable;
 
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.HashMap;
-import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.OptionalLong;
@@ -117,7 +150,6 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ThreadFactory;
-import java.util.concurrent.atomic.AtomicInteger;
 import java.util.stream.Collectors;
 
 import static org.apache.flink.runtime.concurrent.FutureUtils.assertNoException;
@@ -175,6 +207,7 @@ public abstract class StreamTask<OUT, OP extends StreamOperator<OUT>> extends Ab
 
     /** The logger used by the StreamTask and its subclasses. */
     protected static final Logger LOG = LoggerFactory.getLogger(StreamTask.class);
+    private static final Marker GROUP_SHARE = MarkerFactory.getMarker("GroupShare");
 
     // ------------------------------------------------------------------------
 
@@ -262,6 +295,48 @@ public abstract class StreamTask<OUT, OP extends StreamOperator<OUT>> extends Ab
     private Timer timer = new Timer();
     private final CompletableFuture<Void> terminationFuture = new CompletableFuture<>();
 
+    /** Connection to the task manager. */
+    private TaskManagerActions taskManagerActions;
+
+    /**
+     * Boolean that signifies whether the task is blocked waiting to receive state
+     * (state migration has not been completed)
+     * This boolean is for state that is in-memory (will be received by the Task Manager)
+     */
+    private volatile boolean isWaitingForInMemState = false;
+
+    /**
+     * Boolean that signifies whether the task is blocked waiting to receive state
+     * (state migration has not been completed)
+     * This boolean is for state that is serialized (will be received by the Job Manager)
+     */
+    private boolean isWaitingForSerializedState = false;
+
+    /**
+     * The control message that is pending to be sent downstream. This is used from the receiver
+     * task of state migration to send the control message downstream once state migration is
+     * completed.
+     */
+    private ReconfigurationControlMessage pendingControlMessage = null;
+
+    /**
+     * This boolean is true if the dop must be changed when the pending control message is emitted
+     */
+    private boolean changeDOPafterPendingControlMessage = false;
+
+    /**
+     * Indicates whether the pointer to the streamTask has been set in the SourceFunction.
+     * This is used during unsharing for the SourceFunction to instruct the streamTask to send the
+     * pending control message once the barrier from the data generators is received.
+     */
+    private boolean pointerInSourceFunctionSet = false;
+
+    private boolean pendingSerializedStateBool = false;
+    private Map<Integer, Map<Integer, byte[]>> pendingSerializedState;
+    private Map<Integer, HashMap<byte[], byte[]>> pendingSerializedDedupMaps;
+    private List<byte[]> pendingSerializedTriggers;
+    private Map<Integer, Map<Integer, byte[]>> pendingSerializedStatePassiveQuery;
+    private Map<Integer, String> pendingSerializedStateNameDict;
 
     // ------------------------------------------------------------------------
 
@@ -382,31 +457,936 @@ public abstract class StreamTask<OUT, OP extends StreamOperator<OUT>> extends Ab
     }
 
     @Override
-    public void sendControl(ControlMessage controlMessage) {
-        TaskInfo info = getEnvironment().getTaskInfo();
-        String name = info.getTaskName();
-        JobVertexID jobVId = getEnvironment().getJobVertexId();
-        int subtaskIdx = info.getIndexOfThisSubtask();
-        String workerName = name+"-"+subtaskIdx;
-        System.out.println("receiving control message"+name+" "+subtaskIdx+" isRunning="+isRunning);
-        if(System.getProperty("controlSleepTime")!=null){
-            try {
-                Thread.sleep(Long.parseLong(System.getProperty("controlSleepTime")));
-            }catch(Exception ignored){
+    public void setTaskManagerActions(TaskManagerActions taskManagerActions) {
+        this.taskManagerActions = taskManagerActions;
+    }
 
+    @Override
+    public void sendStateToReceiver(Map<String, Map<Integer, StateMap<?, ?, ?>>> state,
+                                    Map<String, Map<Integer, StateMap<?, ?, ?>>> statePassiveQuery,
+                                    Map<Integer, HashMap<?, ?>> dedupMaps,
+                                    List<HeapPriorityQueueElement> triggers) {
+        assert isWaitingForInMemState;
+        if (state != null) {
+            LOG.debug(GROUP_SHARE, "The state is not null " + getEnvironment().getTaskInfo().getTaskName()
+                    + "-" + getEnvironment().getTaskInfo().getIndexOfThisSubtask());
+        }
+        else {
+            LOG.debug(GROUP_SHARE, "The state is null " + getEnvironment().getTaskInfo().getTaskName()
+                    + "-" + getEnvironment().getTaskInfo().getIndexOfThisSubtask());
+        }
+
+        if (mainOperator instanceof AbstractStreamOperator){
+            if (pendingControlMessage == null ) {
+                throw new RuntimeException("The pending control message is null " + getEnvironment().getTaskInfo().getTaskName()
+                        + "-" + getEnvironment().getTaskInfo().getIndexOfThisSubtask());
+            }
+            int index = pendingControlMessage.activeChannelsOfActiveGroup.indexOf(
+                    getEnvironment().getTaskInfo().getIndexOfThisSubtask());
+            ((AbstractStreamOperator) mainOperator).getRuntimeContext()
+                    .incorporateReceivedState(state, statePassiveQuery,
+                            pendingControlMessage.newDOPActive, index);
+            if (mainOperator instanceof WindowOperator || mainOperator instanceof KeyedCoProcessOperator) {
+                LOG.debug(GROUP_SHARE, "This is a windowed operator " + getEnvironment().getTaskInfo().getTaskName()
+                        + "-" + getEnvironment().getTaskInfo().getIndexOfThisSubtask());
+                InternalTimerServiceImpl timerService = mainOperator instanceof WindowOperator ?
+                        ((WindowOperator) mainOperator).getInternalTimerService() :
+                        ((KeyedCoProcessOperator) mainOperator).getInternalTimerService();
+
+                timerService.incorporateReceivedWindowState(
+                        dedupMaps,
+                        triggers,
+                        pendingControlMessage.newDOPActive,
+                        index,
+                        pendingControlMessage.maxParallelism,
+                        pendingControlMessage.oldDOPActive);
             }
         }
-        if(!isRunning){return;}
+
+        if (mainOperator instanceof KeyedCoProcessOperator) {
+            if (((AbstractUdfStreamOperator) mainOperator).getUserFunction()
+                    instanceof KeyedCoProcessFunction) {
+                LOG.debug(GROUP_SHARE, "This is a KeyedCoProcessFunction! " + getEnvironment().getTaskInfo().getTaskName()
+                        + "-" + getEnvironment().getTaskInfo().getIndexOfThisSubtask());
+            }
+        }
+        isWaitingForInMemState = false;
+        tryToSendPendingControlMessage();
+
+        if (pendingSerializedStateBool) {
+            incorporateSerializedState(pendingSerializedState, pendingSerializedDedupMaps,
+                    pendingSerializedTriggers, pendingSerializedStatePassiveQuery,
+                    pendingSerializedStateNameDict);
+        }
+    }
+
+    @Override
+    public void sendStateToReceiverDownstream(Map<String, StateMap<?, ?, ?>[]> state,
+                                              HashMap<?, ?>[] dedupMaps,
+                                              HeapPriorityQueueElement[] triggers, int queueSize) {
+        if (state != null) {
+            LOG.debug(GROUP_SHARE, "The state is not null " + getEnvironment().getTaskInfo().getTaskName()
+                    + " " + getEnvironment().getTaskInfo().getIndexOfThisSubtask());
+            if (mainOperator instanceof AbstractStreamOperator){
+                ((AbstractStreamOperator) mainOperator).getRuntimeContext()
+                        .incorporateReceivedState(state);
+                if (mainOperator instanceof WindowOperator && dedupMaps != null) {
+                    //LOG.debug(GROUP_SHARE, "The downstream receiver is a WindowOperator");
+                    ((WindowOperator) mainOperator).incorporateReceivedWindowState(
+                            dedupMaps,
+                            triggers,
+                            queueSize);
+                }
+            }
+        }
+        else {
+            LOG.debug(GROUP_SHARE, "The state is null " + getEnvironment().getTaskInfo().getTaskName()
+                    + " " + getEnvironment().getTaskInfo().getIndexOfThisSubtask());
+        }
+
+        isWaitingForInMemState = false;
+        tryToSendPendingControlMessage();
+    }
+
+    @Override
+    public void sendSerializedStateToReceiver(Map<Integer, Map<Integer, byte[]>> state,
+                                              Map<Integer, HashMap<byte[], byte[]>> dedupMaps,
+                                              List<byte[]> triggers,
+                                              Map<Integer, Map<Integer, byte[]>> statePassiveQuery,
+                                              Map<Integer, String> stateNameDict) {
+        assert isWaitingForSerializedState;
+        if (isWaitingForInMemState) {
+            pendingSerializedStateBool = true;
+            pendingSerializedState = state;
+            pendingSerializedDedupMaps = dedupMaps;
+            pendingSerializedTriggers = triggers;
+            pendingSerializedStatePassiveQuery = statePassiveQuery;
+            pendingSerializedStateNameDict = stateNameDict;
+        }
+        else {
+            incorporateSerializedState(state, dedupMaps, triggers, statePassiveQuery, stateNameDict);
+        }
+    }
+
+    private void incorporateSerializedState(Map<Integer, Map<Integer, byte[]>> state,
+                                            Map<Integer, HashMap<byte[], byte[]>> dedupMaps,
+                                            List<byte[]> triggers,
+                                            Map<Integer, Map<Integer, byte[]>> statePassiveQuery,
+                                            Map<Integer, String> stateNameDict) {
+        if (mainOperator instanceof AbstractStreamOperator) {
+            if (state != null) {
+                LOG.debug(GROUP_SHARE, "The state from the Job Manager is not null "
+                        + getEnvironment().getTaskInfo().getTaskName()
+                        + "-" + getEnvironment().getTaskInfo().getIndexOfThisSubtask());
+            } else {
+                LOG.debug(GROUP_SHARE, "The state from the Job Manager is null "
+                        + getEnvironment().getTaskInfo().getTaskName()
+                        + "-" + getEnvironment().getTaskInfo().getIndexOfThisSubtask());
+            }
+            ((AbstractStreamOperator) mainOperator).getRuntimeContext()
+                    .incorporateReceivedSerializedState(state, statePassiveQuery, stateNameDict);
+            if ((mainOperator instanceof WindowOperator || mainOperator instanceof KeyedCoProcessOperator)
+                    && dedupMaps != null) {
+                InternalTimerServiceImpl timerService = mainOperator instanceof WindowOperator ?
+                        ((WindowOperator) mainOperator).getInternalTimerService() :
+                        ((KeyedCoProcessOperator) mainOperator).getInternalTimerService();
+
+                timerService.incorporateReceivedSerializedWindowState(dedupMaps, triggers);
+            }
+        }
+        isWaitingForSerializedState = false;
+        if (pendingSerializedStateBool) {
+            pendingSerializedState = null;
+            pendingSerializedDedupMaps = null;
+            pendingSerializedTriggers = null;
+            pendingSerializedStatePassiveQuery = null;
+            pendingSerializedStateNameDict = null;
+            pendingSerializedStateBool = false;
+        }
+        tryToSendPendingControlMessage();
+    }
+
+    @Override
+    public void sendSerializedStateToReceiverDownstream(Map<String, byte[][]> state,
+                                                        HashMap<byte[], byte[]>[] dedupMaps,
+                                                        byte[][] triggers, int queueSize) {
+        if (isWaitingForInMemState) {
+            throw new IllegalStateException("The task received serialized state before in memory state. "
+                    + "The current implementation does not support this.");
+        }
+
+        if (mainOperator instanceof AbstractStreamOperator) {
+            if (state != null) {
+                ((AbstractStreamOperator) mainOperator).getRuntimeContext()
+                        .incorporateReceivedSerializedStateDownstream(state);
+
+                if (mainOperator instanceof WindowOperator
+                        || mainOperator instanceof KeyedCoProcessOperator) {
+                    InternalTimerServiceImpl timerService = mainOperator instanceof WindowOperator ?
+                            ((WindowOperator) mainOperator).getInternalTimerService() :
+                            ((KeyedCoProcessOperator) mainOperator).getInternalTimerService();
+
+                    timerService.incorporateReceivedSerializedWindowStateDownstream(dedupMaps, triggers, queueSize);
+                }
+            }
+        }
+        isWaitingForInMemState = false;
+        tryToSendPendingControlMessage();
+    }
+
+    @Override
+    public void sendControl(ControlMessage controlMessage) {
+        if (controlMessage instanceof ReconfigurationControlMessage) {
+            sendReconfControl((ReconfigurationControlMessage) controlMessage);
+        }
+        else if (controlMessage instanceof StartMonitoringDataDistrControlMessage) {
+            LOG.debug(GROUP_SHARE, "Received start monitoring control message merge - "
+                    + getEnvironment().getTaskInfo().getTaskName()
+                    + "-" + getEnvironment().getTaskInfo().getIndexOfThisSubtask());
+            StartMonitoringDataDistrControlMessage monitoringControlMessage =
+                    (StartMonitoringDataDistrControlMessage) controlMessage;
+            SelectivitiesMonitor selectivitiesMonitorOfCurrentTask = getSelectivitiesMonitor();
+
+            if (selectivitiesMonitorOfCurrentTask != null){
+                selectivitiesMonitorOfCurrentTask.enableMonitoring(
+                        monitoringControlMessage.queryToDataRangesMap,
+                        monitoringControlMessage.dataRanges);
+                sendMonitoringControlMessageDownstream(monitoringControlMessage);
+            } else {
+                JoinMonitor joinMonitorOfCurrentTask = getJoinMonitor();
+                if (joinMonitorOfCurrentTask != null) {
+                    joinMonitorOfCurrentTask.enableMonitoringMerge(
+                            monitoringControlMessage.queryToDataRangesMap,
+                            monitoringControlMessage.dataRanges,
+                            monitoringControlMessage.activeQueries);
+                } else {
+                    sendMonitoringControlMessageDownstream(monitoringControlMessage);
+                }
+            }
+        }
+        else if (controlMessage instanceof StopMonitoringDataDistrControlMessage) {
+            LOG.debug(GROUP_SHARE, "Received stop monitoring control message merge - "
+                    + getEnvironment().getTaskInfo().getTaskName()
+                    + "-" + getEnvironment().getTaskInfo().getIndexOfThisSubtask());
+            JoinMonitor joinMonitor = getJoinMonitor();
+            if (joinMonitor != null) {
+                joinMonitor.disableMonitoringMerge();
+            }
+        }
+        else {
+            throw new UnsupportedOperationException("Control message type not supported");
+        }
+    }
+
+    @Override
+    public FilterDataDistrMergeStats sendStopDataDistrControlFilter(StopMonitoringDataDistrControlMessage controlMessage){
+        LOG.debug(GROUP_SHARE, "Received filter stop monitoring control message merge - "
+                + getEnvironment().getTaskInfo().getTaskName()
+                + "-" + getEnvironment().getTaskInfo().getIndexOfThisSubtask());
+        SelectivitiesMonitor monitoringOperator = getSelectivitiesMonitor();
+        if (monitoringOperator == null) {
+            JoinMonitor joinMonitorOfCurrentTask = getJoinMonitor();
+            if (joinMonitorOfCurrentTask != null) {
+                joinMonitorOfCurrentTask.disableMonitoringMerge();
+            }
+            //sendMonitoringControlMessageDownstream(controlMessage);
+            return null;
+        }
+        sendMonitoringControlMessageDownstream(controlMessage);
+        return monitoringOperator.getFilterDataDistrStats();
+    }
+
+    @Override
+    public JoinDataDistrMergeStats sendStopDataDistrControlJoin(StopMonitoringDataDistrControlMessage controlMessage){
+        LOG.debug(GROUP_SHARE, "Received join stop monitoring control message merge - "
+                + getEnvironment().getTaskInfo().getTaskName()
+                + "-" + getEnvironment().getTaskInfo().getIndexOfThisSubtask());
+        JoinMonitor monitoringOperator = getJoinMonitor();
+        if (monitoringOperator == null) {
+            throw new IllegalStateException("Stop monitoring data distribution control message "
+                    + "received but no monitoring operator found.");
+        }
+        return monitoringOperator.getJoinDataDistrMergeStats();
+    }
+
+    private SelectivitiesMonitor getSelectivitiesMonitor() {
+        for (StreamOperatorWrapper operator : operatorChain.getAllOperators()){
+            if (operator.getStreamOperator() instanceof AbstractUdfStreamOperator) {
+                if (((AbstractUdfStreamOperator) operator.getStreamOperator()).getUserFunction()
+                        instanceof SelectivitiesMonitor) {
+                    return (SelectivitiesMonitor) ((AbstractUdfStreamOperator) operator.getStreamOperator()).getUserFunction();
+                }
+            }
+        }
+        return null;
+    }
+
+    private JoinMonitor getJoinMonitor() {
+        for (StreamOperatorWrapper operator : operatorChain.getAllOperators()){
+            if (operator.getStreamOperator() instanceof AbstractUdfStreamOperator) {
+                if (((AbstractUdfStreamOperator) operator.getStreamOperator()).getUserFunction()
+                        instanceof JoinMonitor) {
+                    return (JoinMonitor) ((AbstractUdfStreamOperator) operator.getStreamOperator()).getUserFunction();
+                }
+            }
+        }
+        return null;
+    }
+
+    public void sendReconfControl(ReconfigurationControlMessage controlMessage) {
+        TaskInfo info = getEnvironment().getTaskInfo();
+        int taskIndex = info.getIndexOfThisSubtask();
+        String taskNameIdx = info.getTaskName() + "-" + taskIndex;
+        if (mainOperator instanceof AbstractStreamOperator && !(recordWriter instanceof NonRecordWriter)){
+            //((AbstractStreamOperator) mainOperator).printOutputClass();
+            LOG.debug(GROUP_SHARE, taskNameIdx + " recordWriter: " + recordWriter.getRecordWriter(0).getClass().getName());
+        }
+
+        /* if (inputProcessor != null && !taskNameIdx.startsWith("Source")) {
+            if (inputProcessor instanceof StreamOneInputProcessor || inputProcessor instanceof StreamTwoInputProcessor
+                || inputProcessor instanceof StreamMultipleInputProcessor) {
+                LOG.debug(GROUP_SHARE, taskNameIdx + " inputProcessor: " + inputProcessor.printClass());
+            }
+            else if (inputProcessor != null){
+                LOG.debug(GROUP_SHARE, taskNameIdx + " inputProcessor: " + inputProcessor.getClass().getName());
+            }
+        }*/
+        /* for (StreamOperatorWrapper operator : operatorChain.getAllOperators()){
+            if (operator.getStreamOperator() instanceof AbstractStreamOperator){
+                ((AbstractStreamOperator) operator.getStreamOperator()).printOutputClass();
+            }
+        }*/
+
+        assert (taskManagerActions != null);
+
+        boolean emitControlMessageDirectly = true;
+        boolean sendLastTupleBeforeEmittingCtrlMsg = false;
+        boolean changeDOP = false;
+
+        // ---------- RECEIVER TASK ----------
+        // the same task can be both sender and receiver
+        if (controlMessage.receivers.contains(taskNameIdx) ||
+                controlMessage.downstreamReceivers.contains(taskNameIdx)){
+            emitControlMessageDirectly = false;
+            LOG.debug(GROUP_SHARE, "State migration: Task " + taskNameIdx + " is a receiver");
+            sendControlReceiver(controlMessage, taskNameIdx, taskIndex, controlMessage.downstreamReceivers.contains(taskNameIdx));
+        }
+        // ---------- SENDER TASK ----------
+        if (controlMessage.senders.contains(taskNameIdx)){
+            LOG.debug(GROUP_SHARE, "State migration: Task " + taskNameIdx + " is a sender");
+            sendStateToTaskManager(controlMessage, taskNameIdx, taskIndex);
+        }
+
+        // ---------- SENDER TASK OF QUERY BEING ADDED TO GROUP (Passive query) ----------
+        if (controlMessage.sendersOfPassiveQuery.contains(taskNameIdx)) {
+            LOG.debug(GROUP_SHARE, "State migration: Task " + taskNameIdx + " is a sender of the passive group ");
+            sendStateToTaskManagerPassiveQuery(controlMessage, taskNameIdx, taskIndex);
+        }
+
+        // ---------- SOURCE TASK ----------
+        if (controlMessage.sourceToResourceIDMap != null &&
+                controlMessage.sourceToResourceIDMap.containsKey(taskNameIdx)) {
+            ResourceID resourceID = controlMessage.sourceToResourceIDMap.get(taskNameIdx);
+            if (controlMessage.sourcesOfActiveQuery.get(resourceID) != null &&
+                    controlMessage.sourcesOfActiveQuery.get(resourceID).contains(taskNameIdx)) {
+                assert (mainOperator instanceof AbstractUdfStreamOperator &&
+                        (((AbstractUdfStreamOperator) mainOperator).getUserFunction()
+                                instanceof RichParallelSourceFunction));
+                LOG.debug(GROUP_SHARE, "State migration: Task " + taskNameIdx + " is an active source");
+                if (controlMessage.share) {
+                    sendLastTupleBeforeEmittingCtrlMsg = true;
+                } else {
+                    AbstractUdfStreamOperator udfOperator = (AbstractUdfStreamOperator) mainOperator;
+                    if (taskIndex == 0) {
+                        // get current state
+                        ReconfigurableSourceData currentState =
+                                ((RichParallelSourceFunction) udfOperator.getUserFunction()).getData();
+                        String driverPort = String.valueOf(controlMessage.driverPort);
+                        // send the driver job id to the task manager
+                        LOG.debug(GROUP_SHARE, taskNameIdx + " send driver job id to task manager");
+                        taskManagerActions.sendDriverJobIDAndHostname(
+                                currentState.getDriverJobId(),
+                                currentState.getDriverHostname(),
+                                driverPort,
+                                controlMessage.sourcesOfPassiveQuery.keySet(),
+                                controlMessage.activeGroupId);
+                    }
+                    if (!pointerInSourceFunctionSet) {
+                        // set pointer to the streamTask in the SourceFunction
+                        ((RichParallelSourceFunction) udfOperator.getUserFunction())
+                                .setStreamTaskPointer(this);
+                        pointerInSourceFunctionSet = true;
+                    }
+                    // The control message will be sent when the barrier from data generators is aligned
+                    emitControlMessageDirectly = false;
+                    pendingControlMessage = controlMessage;
+                    changeDOPafterPendingControlMessage = true;
+                }
+            } else if (controlMessage.sourcesOfPassiveQuery.get(resourceID) != null &&
+                    controlMessage.sourcesOfPassiveQuery.get(resourceID).contains(taskNameIdx)) {
+                LOG.debug(GROUP_SHARE, "State migration: Task " + taskNameIdx + " is a passive source");
+                taskManagerActions.sendSourceTaskExecutionAttemptID(taskIndex,
+                        getEnvironment().getExecutionId(),
+                        controlMessage.sourcesOfPassiveQuery.get(resourceID).size(),
+                        controlMessage.sourcesOfPassiveQuery.size(),
+                        resourceID, controlMessage.activeGroupId);
+                emitControlMessageDirectly = false;
+                this.pendingControlMessage = controlMessage;
+            }
+        }
+
+        // ---------- UPSTREAM TASK ----------
+        if (controlMessage.upstreamTasks.contains(taskNameIdx)) {
+            if (mainOperator instanceof AbstractStreamOperator && ((AbstractStreamOperator) mainOperator).hasForwardPartitioner()) {
+                LOG.debug(GROUP_SHARE, "State migration: Task " + taskNameIdx + " is an upstream task with a forward partitioner");
+            }
+            else {
+                LOG.debug(GROUP_SHARE, "State migration: Task " + taskNameIdx + " is an upstream task");
+                changeDOP = true;
+                if (!emitControlMessageDirectly) {
+                    changeDOPafterPendingControlMessage = true;
+                }
+            }
+        }
+
+        // ---------- TASK THAT MUST CHANGE THE STATUS OF INPUT CHANNELS ----------
+        /*
+        There is an alternative implementation for correct watermark propagation while reconfiguring
+        the query plans. However, that implementation is not compatible with the current
+        implementation of Watermark generation of SPEGauge.
+        More precisely, to use the alt implementation you must assign watermarks with a
+        WatermarkStrategy withIdleness and make sure watermarks get generated periodically
+
+        The alt implementation is marked with comments in the ChannelSelectorRecordWriter class.
+        You also need to comment the lines bellow.
+
+        The current implementation for watermark generation of SPEGauge has the advantage that
+        watermarks are deterministic and all queries will generate exactly the same watermarks.
+        For this reason, we have not switched to the alt implementation.
+         */
+        // If for debugging purposes you want to monitor the broadcasting and receiving of watermarks,
+        // you can uncomment the lines starting with "GroupShare debug print" in the
+        // ChannelSelectorRecordWriter & StatusWatermarkValve class
+
+        // change state of input channels
+        if (controlMessage.tasksToChangeInputStatus.contains(taskNameIdx)) {
+            if (inputProcessor instanceof StreamOneInputProcessor ||
+                    inputProcessor instanceof StreamTwoInputProcessor) {
+                LOG.debug(GROUP_SHARE, "State migration: Task " + taskNameIdx + " will update the status of input channels");
+                try {
+                    // Set the input channels active/inactive
+                    // This is important for the watermark mechanism to work correctly
+                    List<Integer> activeChannels = controlMessage.isGroupActive ?
+                            controlMessage.activeChannelsOfActiveGroup : controlMessage.activeChannelsOfPassiveGroup;
+                    if (inputProcessor instanceof StreamOneInputProcessor) {
+                        ((StreamOneInputProcessor) inputProcessor).changeChannelsState(
+                                activeChannels);
+                    } else {
+                        ((StreamTwoInputProcessor) inputProcessor).changeChannelsState(
+                                activeChannels);
+                    }
+                } catch (Exception e) {
+                    e.printStackTrace();
+                }
+            }
+            else {
+                throw new UnsupportedOperationException("The input processor is not a StreamOneInputProcessor but a "
+                        + inputProcessor.getClass().getName()
+                        + ". Setting status of input channels not supported");
+            }
+        }
+
+        // ---------- Query set Assigner TASK ----------
+        // Checking whether the taskName **contains** "QuerySetAssigner" instead of startsWith allows
+        // us to chain the QuerySetAssigner with other operators.
+        if (controlMessage.querySet != null && taskNameIdx.contains("QuerySetAssigner")) {
+            LOG.debug(GROUP_SHARE, "State migration: Task " + taskNameIdx + " is a QuerySetAssigner");
+            for (StreamOperatorWrapper operator : operatorChain.getAllOperators()){
+                LOG.debug(GROUP_SHARE, "Setting querySet");
+                if (operator.getStreamOperator() instanceof AbstractUdfStreamOperator) {
+                    if (((AbstractUdfStreamOperator) operator.getStreamOperator()).getUserFunction()
+                            instanceof QuerySetAssigner) {
+                        ((QuerySetAssigner) ((AbstractUdfStreamOperator) operator.getStreamOperator())
+                                .getUserFunction()).setActiveQueries(controlMessage.querySet);
+                        break;
+                    }
+                }
+            }
+        }
+
+        // ---------- DOWNSTREAM SENDER TASK ----------
+        if (controlMessage.downstreamSenders.contains(taskNameIdx)){
+            LOG.debug(GROUP_SHARE, "State migration: Task " + taskNameIdx + " is a downstream sender");
+            sendStateToTaskManagerDownstream(controlMessage, taskNameIdx, taskIndex);
+        }
+
+        if (emitControlMessageDirectly) {
+            if(!isRunning){return;}
+
+            sendControlMessageDownstream(controlMessage, sendLastTupleBeforeEmittingCtrlMsg, changeDOP);
+        }
+    }
+
+    private void sendStateToTaskManager(ReconfigurationControlMessage controlMessage, String taskNameIdx, int taskIndex) {
+        // TODO GroupShare this logic should be in the mailbox thread?
+        if (mainOperator instanceof AbstractStreamOperator){
+            // ((AbstractStreamOperator) mainOperator).getRuntimeContext().printState(taskNameIdx);
+
+            // task manager id -> partition -> state id -> key group id -> state
+            Map<ResourceID, Map<Integer, Map<Integer, Map<Integer, byte[]>>>> stateForOtherTMs =
+                    new HashMap<>(2);
+            Map<Integer, String> stateNameDict = new HashMap<>(2);
+            // get state to be migrated
+            Map<Integer, Map<String, Map<Integer, StateMap<?, ?, ?>>>> state =
+                    ((AbstractStreamOperator) mainOperator)
+                            .getRuntimeContext()
+                            .getEntriesForMigration(controlMessage.newDOPActive,
+                                    taskIndex,
+                                    controlMessage.maxParallelism,
+                                    controlMessage.partitionToResourceIDMap,
+                                    stateForOtherTMs, stateNameDict,
+                                    controlMessage.activeChannelsOfActiveGroup);
+
+            assert controlMessage.numOfSenders != null;
+            assert controlMessage.numOfReceivers != null;
+            int numOfSenders = getNumOfTasks(controlMessage.numOfSenders, taskNameIdx,
+                    controlMessage.taskToResourceIDMap);
+            int numOfReceivers = getNumOfTasks(controlMessage.numOfReceivers, taskNameIdx,
+                    controlMessage.taskToResourceIDMap);
+
+            if (mainOperator instanceof WindowOperator || mainOperator instanceof KeyedCoProcessOperator) {
+                LOG.debug(GROUP_SHARE, "This is a " + mainOperator.getClass().getName() + " " + getEnvironment().getTaskInfo().getTaskName()
+                        + "-" + getEnvironment().getTaskInfo().getIndexOfThisSubtask());
+                InternalTimerServiceImpl timerService = mainOperator instanceof WindowOperator ?
+                        ((WindowOperator) mainOperator).getInternalTimerService() :
+                        ((KeyedCoProcessOperator) mainOperator).getInternalTimerService();
+                Map<ResourceID, Map<Integer, Map<Integer, HashMap<?, ?>>>> dedupMapsForOtherTMs =
+                        new HashMap<>();
+                Map<Integer, Map<Integer, HashMap<?, ?>>> dedupMaps = timerService.getDeduplicationMapsForMigration(
+                        controlMessage.newDOPActive, controlMessage.oldDOPActive, taskIndex,
+                        controlMessage.maxParallelism,
+                        controlMessage.partitionToResourceIDMap,
+                        dedupMapsForOtherTMs, controlMessage.activeChannelsOfActiveGroup);
+                Map<ResourceID, Map<Integer, List<HeapPriorityQueueElement>>> triggersForOtherTMs =
+                        new HashMap<>();
+                Map<Integer, List<HeapPriorityQueueElement>> triggers =
+                        timerService.getElementsForMigration(
+                                controlMessage.newDOPActive, taskIndex,
+                                controlMessage.maxParallelism,
+                                controlMessage.partitionToResourceIDMap,
+                                triggersForOtherTMs,
+                                controlMessage.activeChannelsOfActiveGroup);
+
+                taskManagerActions.sendState(taskIndex, state, stateForOtherTMs, dedupMaps, triggers,
+                        serializeDedupMaps(dedupMapsForOtherTMs), serializeTriggers(triggersForOtherTMs),
+                        numOfSenders, numOfReceivers, stateNameDict,
+                        controlMessage.multipleTMsInvolvedInMigration,
+                        controlMessage.numberOfSenderTMsInvolvedInMigration,
+                        controlMessage.activeGroupId);
+            }
+            else {
+                // send the state to the task manager
+                taskManagerActions.sendState(taskIndex, state, stateForOtherTMs,
+                        numOfSenders, numOfReceivers, stateNameDict,
+                        controlMessage.multipleTMsInvolvedInMigration,
+                        controlMessage.numberOfSenderTMsInvolvedInMigration,
+                        controlMessage.activeGroupId);
+            }
+        }
+        else {
+            throw new RuntimeException("The target operator is not a stream operator." + taskNameIdx);
+        }
+    }
+
+    private Map<ResourceID, Map<Integer, Map<Integer, HashMap<byte[], byte[]>>>> serializeDedupMaps(
+            Map<ResourceID, Map<Integer, Map<Integer, HashMap<?, ?>>>> dedupMaps) {
+        InternalTimerServiceImpl timerService = mainOperator instanceof WindowOperator ?
+                ((WindowOperator) mainOperator).getInternalTimerService() :
+                ((KeyedCoProcessOperator) mainOperator).getInternalTimerService();
+
+        TypeSerializer keySerializer = timerService.getKeySerializer().duplicate();
+        TypeSerializer namespaceSerializer = timerService.getNamespaceSerializer().duplicate();
+
+        Map<ResourceID, Map<Integer, Map<Integer, HashMap<byte[], byte[]>>>> serializedDedupMaps = new HashMap<>();
+        for (Map.Entry<ResourceID, Map<Integer, Map<Integer, HashMap<?, ?>>>> entry : dedupMaps.entrySet()) {
+            ResourceID tmID = entry.getKey();
+            Map<Integer, Map<Integer, HashMap<byte[], byte[]>>> serializedDedupMapsForTM = new HashMap<>();
+
+            for (Map.Entry<Integer, Map<Integer, HashMap<?, ?>>> entry2 : entry.getValue().entrySet()) {
+                int partition = entry2.getKey();
+                Map<Integer, HashMap<byte[], byte[]>> serializedDedupMapsForPartition = new HashMap<>();
+                for (Map.Entry<Integer, HashMap<?, ?>> entry3 : entry2.getValue().entrySet()) {
+                    int keyGroupIndex = entry3.getKey();
+                    HashMap<byte[], byte[]> serializedDedupMapsForKeyGroup = serializeDedupMap(
+                            entry3.getValue(), keySerializer, namespaceSerializer);
+                    serializedDedupMapsForPartition.put(
+                            keyGroupIndex,
+                            serializedDedupMapsForKeyGroup);
+                }
+                serializedDedupMapsForTM.put(partition, serializedDedupMapsForPartition);
+            }
+            serializedDedupMaps.put(tmID, serializedDedupMapsForTM);
+        }
+        return serializedDedupMaps;
+    }
+
+    private HashMap<byte[], byte[]>[] serializeDedupMaps(HashMap<?, ?>[] dedupMaps) {
+        InternalTimerServiceImpl timerService = mainOperator instanceof WindowOperator ?
+                ((WindowOperator) mainOperator).getInternalTimerService() :
+                ((KeyedCoProcessOperator) mainOperator).getInternalTimerService();
+
+        TypeSerializer keySerializer = timerService.getKeySerializer().duplicate();
+        TypeSerializer namespaceSerializer = timerService.getNamespaceSerializer().duplicate();
+
+        HashMap<byte[], byte[]>[] serializedDedupMaps = new HashMap[dedupMaps.length];
+        for (int i = 0; i < dedupMaps.length; i++) {
+            serializedDedupMaps[i] = serializeDedupMap(dedupMaps[i], keySerializer, namespaceSerializer);
+        }
+        return serializedDedupMaps;
+    }
+
+    private HashMap<byte[], byte[]> serializeDedupMap(
+            HashMap<?, ?> dedupMap, TypeSerializer keySerializer, TypeSerializer namespaceSerializer){
+        HashMap<byte[], byte[]> serializedDedupMap = new HashMap<>();
+        for (Map.Entry<?, ?> entry4 : dedupMap.entrySet()) {
+            assert ((entry4.getKey() instanceof TimerHeapInternalTimer) &&
+                    !(entry4.getValue() instanceof TimerHeapInternalTimer)) :
+                    "The deduplication map is not of type TimerHeapInternalTimer";
+            TimerHeapInternalTimer key = (TimerHeapInternalTimer) entry4.getKey();
+            TimerHeapInternalTimer value = (TimerHeapInternalTimer) entry4.getValue();
+            byte[] serializedKey = serializeTimer(
+                    key,
+                    keySerializer,
+                    namespaceSerializer);
+            byte[] serializedValue = serializeTimer(
+                    value,
+                    keySerializer,
+                    namespaceSerializer);
+
+            serializedDedupMap.put(serializedKey, serializedValue);
+        }
+        return serializedDedupMap;
+    }
+
+    private Map<ResourceID, Map<Integer, List<byte[]>>> serializeTriggers(
+            Map<ResourceID, Map<Integer, List<HeapPriorityQueueElement>>> triggers) {
+        InternalTimerServiceImpl timerService = mainOperator instanceof WindowOperator ?
+                ((WindowOperator) mainOperator).getInternalTimerService() :
+                ((KeyedCoProcessOperator) mainOperator).getInternalTimerService();
+
+        TypeSerializer keySerializer = timerService.getKeySerializer().duplicate();
+        TypeSerializer namespaceSerializer = timerService.getNamespaceSerializer().duplicate();
+
+        Map<ResourceID, Map<Integer, List<byte[]>>> serializedTriggers = new HashMap<>();
+        for (Map.Entry<ResourceID, Map<Integer, List<HeapPriorityQueueElement>>> entry : triggers.entrySet()) {
+            ResourceID tmID = entry.getKey();
+            Map<Integer, List<byte[]>> serializedTriggersForTM = new HashMap<>();
+            for (Map.Entry<Integer, List<HeapPriorityQueueElement>> entry2 : entry.getValue().entrySet()) {
+                int partition = entry2.getKey();
+                List<byte[]> serializedTriggersList = new ArrayList<>();
+                for (HeapPriorityQueueElement trigger : entry2.getValue()) {
+                    assert trigger instanceof TimerHeapInternalTimer :
+                            "The trigger is not of type TimerHeapInternalTimer";
+                    byte[] serializedTimer = serializeTimer((TimerHeapInternalTimer) trigger,
+                            keySerializer, namespaceSerializer);
+                    serializedTriggersList.add(serializedTimer);
+                }
+                serializedTriggersForTM.put(partition, serializedTriggersList);
+            }
+            serializedTriggers.put(tmID, serializedTriggersForTM);
+        }
+        return serializedTriggers;
+    }
+
+    private byte[][] serializeTriggers(HeapPriorityQueueElement[] triggers) {
+        InternalTimerServiceImpl timerService = mainOperator instanceof WindowOperator ?
+                ((WindowOperator) mainOperator).getInternalTimerService() :
+                ((KeyedCoProcessOperator) mainOperator).getInternalTimerService();
+
+        TypeSerializer keySerializer = timerService.getKeySerializer().duplicate();
+        TypeSerializer namespaceSerializer = timerService.getNamespaceSerializer().duplicate();
+
+        byte[][] serializedTriggers = new byte[triggers.length][];
+        for (int i = 0; i < triggers.length; i++) {
+            assert triggers[i] instanceof TimerHeapInternalTimer :
+                    "The trigger is not of type TimerHeapInternalTimer";
+            serializedTriggers[i] = serializeTimer((TimerHeapInternalTimer) triggers[i],
+                    keySerializer, namespaceSerializer);
+        }
+        return serializedTriggers;
+    }
+
+    private byte[] serializeTimer(TimerHeapInternalTimer timer, TypeSerializer keySerializer,
+                                  TypeSerializer namespaceSerializer) {
+        try {
+            ByteArrayOutputStreamWithPos outputStream = new ByteArrayOutputStreamWithPos();
+            DataOutputView outputView = new DataOutputViewStreamWrapper(outputStream);
+            outputView.writeLong(MathUtils.flipSignBit(timer.getTimestamp()));
+            keySerializer.serialize(timer.getKey(), outputView);
+            namespaceSerializer.serialize(timer.getNamespace(), outputView);
+            return outputStream.toByteArray();
+        } catch (IOException e) {
+            throw new RuntimeException("Could not serialize the timer");
+        }
+    }
+
+    private void sendStateToTaskManagerPassiveQuery(ReconfigurationControlMessage controlMessage, String taskNameIdx, int taskIndex) {
+        int numOfSenders = getNumOfTasks(controlMessage.numOfSenders, taskNameIdx,
+                controlMessage.taskToResourceIDMap);
+        int numOfReceivers = getNumOfTasks(controlMessage.numOfReceivers, taskNameIdx,
+                controlMessage.taskToResourceIDMap);
+
+        if (mainOperator instanceof AbstractStreamOperator){
+            Map<Integer, Map<String, Map<Integer, StateMap<?, ?, ?>>>> state;
+            Map<ResourceID, Map<Integer, Map<Integer, Map<Integer, byte[]>>>> stateForOtherTMs =
+                    new HashMap<>(controlMessage.newDOPActive);
+            Map<Integer, String> stateMapDict = new HashMap<>(2);
+            if (controlMessage.migrationType == MIGRATION_TYPE_FROM_PASSIVE_QUERY.KEY_RANGE) {
+                state = ((AbstractStreamOperator) mainOperator)
+                        .getRuntimeContext()
+                        .getEntriesInRangeForMigration(controlMessage.newDOPActive,
+                                taskIndex,
+                                controlMessage.maxParallelism,
+                                controlMessage.rangeForMigration.start,
+                                controlMessage.rangeForMigration.end,
+                                controlMessage.rangeForMigration.start2,
+                                controlMessage.rangeForMigration.end2,
+                                controlMessage.partitionToResourceIDMap,
+                                controlMessage.partitionToResourceIDMapPassive,
+                                stateForOtherTMs, stateMapDict, controlMessage.activeChannelsOfActiveGroup);
+            }
+            else if (controlMessage.migrationType == MIGRATION_TYPE_FROM_PASSIVE_QUERY.ENTIRE_STATE) {
+                state = ((AbstractStreamOperator) mainOperator)
+                        .getRuntimeContext()
+                        .getEntireStateForMigration(controlMessage.newDOPActive, taskIndex,
+                                controlMessage.maxParallelism,
+                                controlMessage.partitionToResourceIDMap,
+                                controlMessage.partitionToResourceIDMapPassive, stateForOtherTMs,
+                                stateMapDict, controlMessage.activeChannelsOfActiveGroup);
+            }
+            else {
+                throw new RuntimeException("Migration type is NO_MIGRATION but a task is declared as "
+                        + "sender of passive query");
+            }
+            taskManagerActions.sendStatePassiveQuery(taskIndex, state, stateForOtherTMs,
+                    stateMapDict, numOfSenders, numOfReceivers, controlMessage.activeGroupId);
+        }
+        else {
+            throw new RuntimeException("The target operator is not a stream operator." + taskNameIdx);
+        }
+    }
+
+    private void sendStateToTaskManagerDownstream(ReconfigurationControlMessage controlMessage, String taskNameIdx, int taskIndex) {
+        // TODO GroupShare this logic should be in the mailbox thread?
+        if (mainOperator instanceof AbstractStreamOperator){
+            // TODO GroupShare remove (this is here for debugging)
+            //if (LOG.isDebugEnabled()) {
+            // ((AbstractStreamOperator) mainOperator).getRuntimeContext().printState(taskNameIdx);
+            //}
+
+            ResourceID receiverTM = controlMessage.partitionToResourceIDMapDownstreamReceivers.get(taskIndex);
+            boolean stateToBeMigratedToTheSameTM =
+                    controlMessage.partitionToResourceIDMapDownstreamSenders.get(taskIndex)
+                            .equals(receiverTM);
+
+            Map<String, byte[][]> stateForOtherTM = new HashMap<>();
+            Map<String, StateMap<?, ?, ?>[]> state = ((AbstractStreamOperator) mainOperator)
+                    .getRuntimeContext().getEntriesForMigrationDownstream(
+                            (!stateToBeMigratedToTheSameTM), stateForOtherTM);
+
+            if (mainOperator instanceof WindowOperator) {
+                HashMap<?, ?>[] dedupMaps = ((WindowOperator) mainOperator)
+                        .getDeduplicationMapsForMigration();
+                HeapPriorityQueueElement[] triggers = ((WindowOperator) mainOperator)
+                        .getTriggersForMigration();
+                int queueSize = ((WindowOperator) mainOperator).getQueueSize();
+
+                // serialize dedupMaps and triggers
+                HashMap<byte[], byte[]>[] serializedDedupMaps = stateToBeMigratedToTheSameTM ? null :
+                        serializeDedupMaps(dedupMaps);
+                byte[][] serializedTriggers = stateToBeMigratedToTheSameTM ? null :
+                        serializeTriggers(triggers);
+
+                taskManagerActions.sendStateOfDownstream(taskIndex, state, stateForOtherTM,
+                        dedupMaps, serializedDedupMaps, triggers, serializedTriggers, queueSize,
+                        controlMessage.downstreamSenders.size(), receiverTM,
+                        controlMessage.multipleTMsInvolvedInMigrationDownstream,
+                        controlMessage.numberOfSenderTMsInvolvedInMigrationDownstream,
+                        controlMessage.activeGroupId);
+            }
+            else {
+                // send the state to the task manager
+                taskManagerActions.sendStateOfDownstream(taskIndex, state, stateForOtherTM,
+                        controlMessage.downstreamSenders.size(), receiverTM,
+                        controlMessage.multipleTMsInvolvedInMigrationDownstream,
+                        controlMessage.numberOfSenderTMsInvolvedInMigrationDownstream,
+                        controlMessage.activeGroupId);
+            }
+        }
+        else {
+            LOG.info("The target operator is not a stream operator.");
+        }
+    }
+
+    private void sendControlReceiver(ReconfigurationControlMessage controlMessage, String taskNameIdx, int taskIndex,
+                                     boolean isDownstream) {
+        // a receiver must communicate to the taskManager its executionId
+        if (isDownstream) {
+            taskManagerActions.sendDownstreamReceiverExecutionAttemptID(taskIndex,
+                    getEnvironment().getExecutionId(),
+                    controlMessage.downstreamReceivers.size(), controlMessage.activeGroupId);
+        }
+        else {
+            assert controlMessage.numOfSenders != null;
+            assert controlMessage.numOfReceivers != null;
+            int numOfSenders = getNumOfTasks(controlMessage.numOfSenders, taskNameIdx,
+                    controlMessage.taskToResourceIDMap);
+            int numOfReceivers = getNumOfTasks(controlMessage.numOfReceivers, taskNameIdx,
+                    controlMessage.taskToResourceIDMap);
+
+            taskManagerActions.sendReceiverExecutionAttemptID(taskIndex,
+                    getEnvironment().getExecutionId(), numOfSenders,
+                    numOfReceivers, controlMessage.multipleTMsInvolvedInMigration,
+                    controlMessage.numberOfSenderTMsInvolvedInMigration,
+                    controlMessage.activeGroupId);
+        }
+        this.isWaitingForInMemState = true;
+        this.isWaitingForSerializedState = controlMessage.multipleTMsInvolvedInMigration;
+        if (controlMessage.multipleTMsInvolvedInMigration && controlMessage.numOfSenders.size() == 1) {
+            if (controlMessage.numOfSenders.containsKey(controlMessage.taskToResourceIDMap.get(taskNameIdx))){
+                this.isWaitingForSerializedState = false;
+            }
+        }
+        this.pendingControlMessage = controlMessage;
+    }
+
+    private void tryToSendPendingControlMessage() {
+        if (isWaitingForInMemState || isWaitingForSerializedState) {
+            LOG.debug(GROUP_SHARE, "Waiting for state migration to finish "
+                    + isWaitingForInMemState + " " + isWaitingForSerializedState + " "
+                    + getEnvironment().getTaskInfo().getTaskName()
+                    + "-" + getEnvironment().getTaskInfo().getIndexOfThisSubtask());
+            return;
+        }
+        if (isRunning) {
+            assert (pendingControlMessage != null);
+            sendControlMessageDownstream(
+                    pendingControlMessage,
+                    false, changeDOPafterPendingControlMessage);
+        }
+        pendingControlMessage = null;
+        changeDOPafterPendingControlMessage = false;
+        LOG.debug(GROUP_SHARE, "Pending control message sent "
+                + getEnvironment().getTaskInfo().getTaskName()
+                + "-" + getEnvironment().getTaskInfo().getIndexOfThisSubtask());
+    }
+
+    private List<Integer> getNewActiveChannels(ReconfigurationControlMessage controlMessage) {
+        List<Integer> newActiveChannels = null;
+        if ((controlMessage.isGroupActive)) {
+            newActiveChannels = controlMessage.activeChannelsOfActiveGroup;
+        }
+        if (!controlMessage.isGroupActive && !controlMessage.share) {
+            newActiveChannels = controlMessage.activeChannelsOfPassiveGroup;
+        }
+        return newActiveChannels;
+    }
+
+    @Override
+    public void sendLastTupleData(Map<Integer, ReconfigurableSourceData> lastTupleDataMap) {
+        assert (mainOperator instanceof AbstractUdfStreamOperator &&
+                (((AbstractUdfStreamOperator)mainOperator).getUserFunction()
+                        instanceof RichParallelSourceFunction));
+        // when the passive query receives the last tuple, it must forward downstream the control message
+        // so that the state in the downstream tasks can be migrated to the active query
+        assert pendingControlMessage != null;
+        sendControlMessageDownstream(pendingControlMessage, false, false);
+        AbstractUdfStreamOperator udfOperator = (AbstractUdfStreamOperator) mainOperator;
+        ((RichParallelSourceFunction) udfOperator.getUserFunction())
+                .requestDisconnectionFromDriver(lastTupleDataMap);
+    }
+
+    @Override
+    public void modifySourceConnection(String host, int port) {
+        assert (mainOperator instanceof AbstractUdfStreamOperator &&
+                (((AbstractUdfStreamOperator)mainOperator).getUserFunction()
+                        instanceof RichParallelSourceFunction));
+        AbstractUdfStreamOperator udfOperator = (AbstractUdfStreamOperator) mainOperator;
+        ((RichParallelSourceFunction) udfOperator.getUserFunction())
+                .modifySourceConnection(host, port);
+
+        // when the passive query receives the new source connection info, it must forward downstream
+        // the control message so that the state can be migrated from the downstream operators of
+        // the active query to the downstream of the passive
+        assert pendingControlMessage != null;
+        sendControlMessageDownstream(pendingControlMessage, false, false);
+    }
+
+    public void sendPendingControlMessgaeDownstream() {
+        if (pendingControlMessage != null) {
+            TaskInfo info = getEnvironment().getTaskInfo();
+            int taskIndex = info.getIndexOfThisSubtask();
+            sendControlMessageDownstream(
+                    pendingControlMessage, false,
+                    changeDOPafterPendingControlMessage);
+            changeDOPafterPendingControlMessage = false;
+            pendingControlMessage = null;
+        }
+    }
+
+    private void sendControlMessageDownstream(
+            ReconfigurationControlMessage controlMessage, boolean sendLastTupleBeforeEmittingCtrlMsg,
+            boolean changeDOP) {
+        TaskInfo info = getEnvironment().getTaskInfo();
+        String name = info.getTaskName();
+        int subtaskIdx = info.getIndexOfThisSubtask();
+        String taskNameIdx = name + "-" + subtaskIdx;
+        LOG.debug(GROUP_SHARE, "Sending control message downstream from " + taskNameIdx + " with changeDOP = " + changeDOP);
         try{
             CompletableFuture<Void> f = new CompletableFuture<>();
             mainMailboxExecutor.execute(() -> {
-                controlMessage.callback().accept(new Object[]{jobVId, subtaskIdx, name});
-                CheckpointBarrier barrier = new CheckpointBarrier(ControlMessage.FixedEpochNumber(), -1, CheckpointOptions.forCheckpointWithDefaultLocation());
+
+                if (sendLastTupleBeforeEmittingCtrlMsg) {
+                    AbstractUdfStreamOperator udfOperator = (AbstractUdfStreamOperator) mainOperator;
+                    // get current state
+                    ReconfigurableSourceData lastTupleData =
+                            ((RichParallelSourceFunction) udfOperator.getUserFunction()).getData();
+                    ResourceID resourceID = controlMessage.sourceToResourceIDMap.get(taskNameIdx);
+                    // send it to the task manager
+                    taskManagerActions.sendLastTupleData(
+                            lastTupleData.getDriverSubTaskIdx(), lastTupleData,
+                            controlMessage.sourcesOfActiveQuery.get(resourceID).size(),
+                            controlMessage.sourcesOfActiveQuery.size(), controlMessage.activeGroupId);
+                }
+                //controlMessage.callback().accept(new Object[]{jobVId, subtaskIdx, name});
+                CheckpointBarrier barrier = new CheckpointBarrier(ControlMessage.FixedEpochNumber,
+                        -1, CheckpointOptions.forCheckpointWithDefaultLocation());
                 barrier.setMessage(controlMessage);
-                operatorChain.broadcastEvent(barrier, false, controlMessage.MCS().get(workerName).stream().map(s -> s.substring(0,s.lastIndexOf('-'))).collect(
-                        Collectors.toSet()));
+                // TODO GroupShare should I put here controlMessage.maxDOP()?
+                boolean changeDOPAfterBarrier = changeDOP;
+                List<Integer> newActiveChannels = getNewActiveChannels(controlMessage);
+                if (changeDOP) {
+                    int oldDOP  = controlMessage.isGroupActive ? controlMessage.oldDOPActive :
+                            controlMessage.oldDOPPassive;
+                    int newDOP = controlMessage.isGroupActive ? controlMessage.newDOPActive :
+                            controlMessage.newDOPPassive;
+                    if (newDOP > oldDOP) {
+                        changeDOP(newDOP, newActiveChannels);
+                        changeDOPAfterBarrier = false; // DOP already changed
+                    }
+                }
+                operatorChain.broadcastEvent(barrier, false,
+                        controlMessage.MCS.get(taskNameIdx).stream()
+                                .map(s -> s.substring(0,s.lastIndexOf('-')))
+                                .collect(Collectors.toSet()));
+                if (changeDOPAfterBarrier) {
+                    int newDOP = controlMessage.isGroupActive ? controlMessage.newDOPActive :
+                            controlMessage.newDOPPassive;
+                    changeDOP(newDOP, newActiveChannels);
+                }
+                setSplitMonitoring(taskNameIdx, controlMessage.enableSplitMonitoring);
                 f.complete(null);
-            },"control",controlMessage, f);
+            },"control", controlMessage, f);
             if(!mailboxProcessor.isMailboxThread()){
                 f.get();
             }
@@ -415,6 +1395,100 @@ public abstract class StreamTask<OUT, OP extends StreamOperator<OUT>> extends Ab
         }
     }
 
+    private void sendMonitoringControlMessageDownstream(
+            ControlMessage controlMessage) {
+        TaskInfo info = getEnvironment().getTaskInfo();
+        String name = info.getTaskName();
+        int subtaskIdx = info.getIndexOfThisSubtask();
+        String taskNameIdx = name + "-" + subtaskIdx;
+        LOG.debug(GROUP_SHARE, "Sending monitoring control message downstream from " + taskNameIdx);
+        try{
+            CompletableFuture<Void> f = new CompletableFuture<>();
+            mainMailboxExecutor.execute(() -> {
+                CheckpointBarrier barrier = new CheckpointBarrier(ControlMessage.FixedEpochNumber,
+                        -1, CheckpointOptions.forCheckpointWithDefaultLocation());
+                barrier.setMessage(controlMessage);
+                operatorChain.broadcastEvent(barrier, false,
+                        controlMessage.MCS.get(taskNameIdx).stream()
+                                .map(s -> s.substring(0,s.lastIndexOf('-')))
+                                .collect(Collectors.toSet()));
+                f.complete(null);
+            },"control", controlMessage, f);
+            if(!mailboxProcessor.isMailboxThread()){
+                f.get();
+            }
+        }catch (Exception e){
+            e.printStackTrace();
+        }
+    }
+
+    private void setSplitMonitoring(String taskName, boolean monitoringEnabled) {
+        if (taskName.contains("StatefulJoin")){
+            JoinMonitor joinMonitor = getJoinMonitor();
+            if (joinMonitor != null) {
+                if (monitoringEnabled) {
+                    joinMonitor.enableMonitoringSplit();
+                } else {
+                    joinMonitor.disableMonitoringSplit();
+                }
+            }
+        }
+    }
+
+    public double getIdlePercentage() {
+        TaskIOMetricGroup ioMetrics = getEnvironment().getMetricGroup().getIOMetricGroup();
+        return ioMetrics.getIdleTimeMsPerSecond().getValue() / 1000.0;
+    }
+
+    private void changeDOP(int newDOPVal, List<Integer> newActiveChannels) {
+        if (recordWriter instanceof SingleRecordWriter) {
+            recordWriter.getRecordWriter(0).setNumberOfChannels(newDOPVal, newActiveChannels);
+        }
+        else if (recordWriter instanceof MultipleRecordWriters){
+            for (int i=0; i < ((MultipleRecordWriters) recordWriter).getNumberOfRecordWriters() ; i++) {
+                ((MultipleRecordWriters) recordWriter)
+                        .getRecordWriter(i)
+                        .setNumberOfChannels(newDOPVal, newActiveChannels);
+            }
+        }
+    }
+
+    private int getNumOfTasks(HashMap<ResourceID, HashMap<String, Integer>> numOfTasks,
+                              String taskNameIdx, HashMap<String, ResourceID> taskToResourceIDMap) {
+        assert numOfTasks != null;
+        HashMap<String, Integer> numOfTasksFromThisTM = numOfTasks
+                .get(taskToResourceIDMap.get(taskNameIdx));
+        if (numOfTasksFromThisTM == null) {
+            return 0;
+        }
+        for (Map.Entry<String, Integer> entry : numOfTasksFromThisTM.entrySet()) {
+            if (taskNameIdx.startsWith(entry.getKey())){
+                return entry.getValue();
+            }
+        }
+        throw new RuntimeException("The number of tasks for " + taskNameIdx + " is not set");
+    }
+
+    @Override
+    public TaskUtilizationStats sendMonitoringMsg() {
+        TaskIOMetricGroup ioMetrics = getEnvironment().getMetricGroup().getIOMetricGroup();
+        long idleTime = ioMetrics.getIdleTimeMsPerSecond().getValue();
+        double busyTime = ioMetrics.getBusyTimePerSecond();
+        long backpressuredTime = ioMetrics.getBackPressuredTimePerSecond().getValue();
+        return new TaskUtilizationStats(idleTime, backpressuredTime, busyTime);
+    }
+
+    @Override
+    public double sendThroughputMonitoringMsg() {
+        TaskIOMetricGroup ioMetrics = getEnvironment().getMetricGroup().getIOMetricGroup();
+        return ioMetrics.getNumRecordsOutPerSecond();
+    }
+
+    @Override
+    public DataDistrSplitStats sendSplitPhaseMonitoringMsg() {
+        JoinMonitor joinMonitor = getJoinMonitor();
+        return joinMonitor.getSplitMonitoringStats();
+    }
 
     @Override
     public void pause() {
@@ -488,6 +1562,10 @@ public abstract class StreamTask<OUT, OP extends StreamOperator<OUT>> extends Ab
      * @throws Exception on any problems in the action.
      */
     protected void processInput(MailboxDefaultAction.Controller controller) throws Exception {
+        if (isWaitingForInMemState || isWaitingForSerializedState) {
+            // we must not process any further input until state migration is completed
+            return;
+        }
         InputStatus status = inputProcessor.processInput();
         if (status == InputStatus.MORE_AVAILABLE && recordWriter.isAvailable()) {
             return;

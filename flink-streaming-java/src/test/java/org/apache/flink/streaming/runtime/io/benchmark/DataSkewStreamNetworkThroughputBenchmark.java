@@ -62,5 +62,11 @@ public class DataSkewStreamNetworkThroughputBenchmark extends StreamNetworkThrou
         public boolean isBroadcast() {
             return false;
         }
+
+        @Override
+        public void setNumberOfChannels(int numberOfChannels) {
+            throw new UnsupportedOperationException(
+                    "DataSkewChannelSelector does not support setNumberOfChannels");
+        }
     }
 }

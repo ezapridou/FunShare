@@ -21,9 +21,16 @@ package org.apache.flink.streaming.api.operators;
 import org.apache.flink.annotation.VisibleForTesting;
 import org.apache.flink.api.common.typeutils.TypeSerializer;
 import org.apache.flink.api.common.typeutils.TypeSerializerSchemaCompatibility;
+import org.apache.flink.core.memory.ByteArrayInputStreamWithPos;
+import org.apache.flink.core.memory.DataInputView;
+import org.apache.flink.core.memory.DataInputViewStreamWrapper;
+import org.apache.flink.runtime.clusterframework.types.ResourceID;
 import org.apache.flink.runtime.state.InternalPriorityQueue;
 import org.apache.flink.runtime.state.KeyGroupRange;
+import org.apache.flink.runtime.state.KeyGroupRangeAssignment;
 import org.apache.flink.runtime.state.KeyGroupedInternalPriorityQueue;
+import org.apache.flink.runtime.state.heap.HeapPriorityQueueElement;
+import org.apache.flink.runtime.state.heap.HeapPriorityQueueSet;
 import org.apache.flink.streaming.runtime.tasks.ProcessingTimeService;
 import org.apache.flink.util.CloseableIterator;
 import org.apache.flink.util.FlinkRuntimeException;
@@ -32,7 +39,9 @@ import org.apache.flink.util.function.BiConsumerWithException;
 
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ScheduledFuture;
 
@@ -55,9 +64,9 @@ public class InternalTimerServiceImpl<K, N> implements InternalTimerService<N> {
             eventTimeTimersQueue;
 
     /** Information concerning the local key-group range. */
-    private final KeyGroupRange localKeyGroupRange;
+    private KeyGroupRange localKeyGroupRange;
 
-    private final int localKeyGroupRangeStartIdx;
+    private int localKeyGroupRangeStartIdx;
 
     /**
      * The local event time, as denoted by the last received {@link
@@ -368,6 +377,158 @@ public class InternalTimerServiceImpl<K, N> implements InternalTimerService<N> {
 
         // restore the processing time timers
         processingTimeTimersQueue.addAll(restoredTimersSnapshot.getProcessingTimeTimers());
+    }
+
+    public Map<Integer, Map<Integer, HashMap<HeapPriorityQueueElement, HeapPriorityQueueElement>>>
+    getDeduplicationMapsForMigration(
+            int newDOP, int oldDOP, int taskIndex, int maxParallelism,
+            Map<Integer, ResourceID> partitionToResourceIDMap,
+            Map<ResourceID, Map<Integer, Map<Integer, HashMap<?, ?>>>> dedupMapsForOtherTMs,
+            List<Integer> partitionIdToTaskId) {
+        checkTimeTimersQueueType(eventTimeTimersQueue);
+        return ((HeapPriorityQueueSet) this.eventTimeTimersQueue)
+                .getDeduplicationMapsForMigration(newDOP, oldDOP, taskIndex, maxParallelism,
+                        partitionToResourceIDMap, dedupMapsForOtherTMs, partitionIdToTaskId);
+    }
+
+    public HashMap<HeapPriorityQueueElement, HeapPriorityQueueElement>[] getDeduplicationMapsForMigration() {
+        checkTimeTimersQueueType(eventTimeTimersQueue);
+        return ((HeapPriorityQueueSet) this.eventTimeTimersQueue).getDeduplicationMapsForMigration();
+    }
+
+    public Map<Integer, List<HeapPriorityQueueElement>> getElementsForMigration(
+            int newDOP, int taskIndex, int maxParallelism,
+            Map<Integer, ResourceID> partitionToResourceIDMap,
+            Map<ResourceID, Map<Integer, List<HeapPriorityQueueElement>>> triggersForOtherTMs,
+            List<Integer> partitionIdToTaskId) {
+        checkTimeTimersQueueType(eventTimeTimersQueue);
+        return ((HeapPriorityQueueSet) this.eventTimeTimersQueue).getElementsForMigration(
+                newDOP, taskIndex, maxParallelism, partitionToResourceIDMap, triggersForOtherTMs,
+                partitionIdToTaskId);
+    }
+
+    public HeapPriorityQueueElement[] getElementsForMigration() {
+        checkTimeTimersQueueType(eventTimeTimersQueue);
+        return ((HeapPriorityQueueSet) this.eventTimeTimersQueue).getElementsForMigration();
+    }
+
+    public int getQueueSize() {
+        checkTimeTimersQueueType(eventTimeTimersQueue);
+        return ((HeapPriorityQueueSet) this.eventTimeTimersQueue).getQueueSize();
+    }
+
+    public void incorporateReceivedWindowState(
+            Map<Integer, HashMap<HeapPriorityQueueElement, HeapPriorityQueueElement>> newDeduplicationMaps,
+            List<HeapPriorityQueueElement> queueElements, int newDOP, int operatorIndex,
+            int maxParallelism, int oldDOP) {
+        this.localKeyGroupRange = KeyGroupRangeAssignment.computeKeyGroupRangeForOperatorIndex(
+                maxParallelism, newDOP, operatorIndex);
+        this.localKeyGroupRangeStartIdx = localKeyGroupRange.getStartKeyGroup();
+        checkTimeTimersQueueType(eventTimeTimersQueue);
+        ((HeapPriorityQueueSet) this.eventTimeTimersQueue)
+                .incorporateDeduplicationMapsFromMigration(newDeduplicationMaps, newDOP, operatorIndex, oldDOP);
+        ((HeapPriorityQueueSet) this.eventTimeTimersQueue).incorporateElementsFromMigration(queueElements);
+        checkTimeTimersQueueType(processingTimeTimersQueue);
+        ((HeapPriorityQueueSet) this.processingTimeTimersQueue).changeParallelism(newDOP, operatorIndex, oldDOP);
+    }
+
+    public void incorporateReceivedWindowState(
+            HashMap<HeapPriorityQueueElement, HeapPriorityQueueElement>[] deduplicationMaps,
+            HeapPriorityQueueElement[] queueElements, int queueSize) {
+        checkTimeTimersQueueType(eventTimeTimersQueue);
+        ((HeapPriorityQueueSet) this.eventTimeTimersQueue)
+                .incorporateDeduplicationMapsFromMigration(deduplicationMaps);
+        ((HeapPriorityQueueSet) this.eventTimeTimersQueue)
+                .incorporateElementsFromMigration(queueElements, queueSize);
+    }
+
+    public void incorporateReceivedSerializedWindowState(
+            Map<Integer, HashMap<byte[], byte[]>> dedupMaps,
+            List<byte[]> triggers) {
+        checkTimeTimersQueueType(eventTimeTimersQueue);
+        if (dedupMaps != null) {
+            incorporateSerializedDedupMapsFromMigration(dedupMaps);
+        }
+        if (triggers != null) {
+            incorporateSerializedTriggersFromMigration(triggers);
+        }
+    }
+
+    public void incorporateReceivedSerializedWindowStateDownstream(
+            HashMap<byte[], byte[]>[] dedupMaps, byte[][] triggers, int queueSize) {
+        checkTimeTimersQueueType(eventTimeTimersQueue);
+        if (dedupMaps != null) {
+            HashMap<HeapPriorityQueueElement, HeapPriorityQueueElement>[] deserializedDedupMaps =
+                    new HashMap[dedupMaps.length];
+            for (int pos = 0; pos < dedupMaps.length; pos++) {
+                HashMap<byte[], byte[]> dedupMap = dedupMaps[pos];
+                HashMap<HeapPriorityQueueElement, HeapPriorityQueueElement> deserializedDedupMap = new HashMap<>();
+                for (Map.Entry<byte[], byte[]> entry : dedupMap.entrySet()) {
+                    byte[] serializedKey = entry.getKey();
+                    byte[] serializedValue = entry.getValue();
+                    TimerHeapInternalTimer key = deserializeTrigger(serializedKey);
+                    TimerHeapInternalTimer value = deserializeTrigger(serializedValue);
+                    deserializedDedupMap.put(key, value);
+                }
+                deserializedDedupMaps[pos] = deserializedDedupMap;
+            }
+            ((HeapPriorityQueueSet) this.eventTimeTimersQueue)
+                    .incorporateDeduplicationMapsFromMigration(deserializedDedupMaps);
+        }
+        if (triggers != null) {
+            HeapPriorityQueueElement[] deserializedTriggers = new HeapPriorityQueueElement[triggers.length];
+            for (int pos = 0; pos < triggers.length; pos++) {
+                byte[] serializedTrigger = triggers[pos];
+                TimerHeapInternalTimer trigger = deserializeTrigger(serializedTrigger);
+                deserializedTriggers[pos] = trigger;
+            }
+            ((HeapPriorityQueueSet) this.eventTimeTimersQueue)
+                    .incorporateElementsFromMigration(deserializedTriggers, queueSize);
+        }
+    }
+
+    private void incorporateSerializedDedupMapsFromMigration(Map<Integer, HashMap<byte[], byte[]>> newDedupMaps) {
+        for (Map.Entry<Integer, HashMap<byte[], byte[]>> newDedupMap : newDedupMaps.entrySet()) {
+            int keyGroupIndex = newDedupMap.getKey();
+            for (Map.Entry<byte[], byte[]> entry : newDedupMap.getValue().entrySet()) {
+                byte[] serializedKey = entry.getKey();
+                byte[] serializedValue = entry.getValue();
+                TimerHeapInternalTimer key = deserializeTrigger(serializedKey);
+                TimerHeapInternalTimer value = deserializeTrigger(serializedValue);
+                ((HeapPriorityQueueSet) this.eventTimeTimersQueue).addInDedupMaps(
+                        keyGroupIndex, key, value);
+            }
+        }
+    }
+
+    private void incorporateSerializedTriggersFromMigration(List<byte[]> triggers) {
+        for (byte[] serializedTrigger : triggers) {
+            TimerHeapInternalTimer trigger = deserializeTrigger(serializedTrigger);
+            ((HeapPriorityQueueSet) this.eventTimeTimersQueue).add(trigger);
+        }
+    }
+
+    private TimerHeapInternalTimer<K, N> deserializeTrigger(byte[] serializedKey) {
+        try {
+            ByteArrayInputStreamWithPos inputStream = new ByteArrayInputStreamWithPos(serializedKey);
+            DataInputView dataInputView = new DataInputViewStreamWrapper(inputStream);
+            long timestamp = dataInputView.readLong();
+            K key = keySerializer.deserialize(dataInputView);
+            N namespace = namespaceSerializer.deserialize(dataInputView);
+            return new TimerHeapInternalTimer<>(timestamp, key, namespace);
+        }
+        catch (Exception e) {
+            throw new RuntimeException("Error while deserializing trigger.", e);
+        }
+    }
+
+    private void checkTimeTimersQueueType(KeyGroupedInternalPriorityQueue<TimerHeapInternalTimer<K, N>> timersQueue) {
+        if (! (timersQueue instanceof HeapPriorityQueueSet)) {
+            throw new UnsupportedOperationException(
+                    "The eventTimeTimers queue is of type: "
+                            + timersQueue.getClass().getName()
+                            + " which does not support state migration.");
+        }
     }
 
     @VisibleForTesting

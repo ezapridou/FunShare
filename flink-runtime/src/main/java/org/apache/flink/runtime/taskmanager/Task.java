@@ -18,7 +18,12 @@
 
 package org.apache.flink.runtime.taskmanager;
 
-import org.apache.flink.runtime.controller.ControlMessage;
+import net.michaelkoepf.spegauge.api.sut.DataDistrSplitStats;
+import net.michaelkoepf.spegauge.api.sut.FilterDataDistrMergeStats;
+import net.michaelkoepf.spegauge.api.sut.JoinDataDistrMergeStats;
+import net.michaelkoepf.spegauge.api.sut.ReconfigurableSourceData;
+
+import org.apache.flink.extensions.controller.ControlMessage;
 
 import org.apache.flink.annotation.VisibleForTesting;
 import org.apache.flink.api.common.ExecutionConfig;
@@ -30,6 +35,7 @@ import org.apache.flink.configuration.Configuration;
 import org.apache.flink.configuration.TaskManagerOptions;
 import org.apache.flink.core.fs.FileSystemSafetyNet;
 import org.apache.flink.core.fs.Path;
+import org.apache.flink.extensions.controller.StopMonitoringDataDistrControlMessage;
 import org.apache.flink.runtime.accumulators.AccumulatorRegistry;
 import org.apache.flink.runtime.blob.PermanentBlobKey;
 import org.apache.flink.runtime.broadcast.BroadcastVariableManager;
@@ -39,6 +45,7 @@ import org.apache.flink.runtime.checkpoint.CheckpointMetaData;
 import org.apache.flink.runtime.checkpoint.CheckpointOptions;
 import org.apache.flink.runtime.clusterframework.types.AllocationID;
 import org.apache.flink.runtime.concurrent.FutureUtils;
+import org.apache.flink.extensions.controller.TaskUtilizationStats;
 import org.apache.flink.runtime.deployment.InputGateDeploymentDescriptor;
 import org.apache.flink.runtime.deployment.ResultPartitionDeploymentDescriptor;
 import org.apache.flink.runtime.execution.CancelTaskException;
@@ -74,6 +81,8 @@ import org.apache.flink.runtime.security.FlinkSecurityManager;
 import org.apache.flink.runtime.shuffle.ShuffleEnvironment;
 import org.apache.flink.runtime.shuffle.ShuffleIOOwnerContext;
 import org.apache.flink.runtime.state.TaskStateManager;
+import org.apache.flink.runtime.state.heap.HeapPriorityQueueElement;
+import org.apache.flink.runtime.state.heap.StateMap;
 import org.apache.flink.runtime.taskexecutor.GlobalAggregateManager;
 import org.apache.flink.runtime.taskexecutor.KvStateService;
 import org.apache.flink.runtime.taskexecutor.PartitionProducerStateChecker;
@@ -731,6 +740,7 @@ public class Task
                 invokable =
                         loadAndInstantiateInvokable(
                                 userCodeClassLoader.asClassLoader(), nameOfInvokableClass, env);
+                invokable.setTaskManagerActions(taskManagerActions);
             } finally {
                 FlinkSecurityManager.unmonitorUserSystemExitForCurrentThread();
             }
@@ -953,6 +963,87 @@ public class Task
         }
     }
 
+    public FilterDataDistrMergeStats sendStopDataDistrControlFilter(StopMonitoringDataDistrControlMessage controlMessage){
+        if(invokable != null) {
+            return invokable.sendStopDataDistrControlFilter(controlMessage);
+        }
+        return null;
+    }
+
+    public JoinDataDistrMergeStats sendStopDataDistrControlJoin(StopMonitoringDataDistrControlMessage controlMessage){
+        if(invokable != null) {
+            return invokable.sendStopDataDistrControlJoin(controlMessage);
+        }
+        return null;
+    }
+
+    public TaskUtilizationStats sendMonitoringMsg(){
+        if(invokable != null) {
+            return invokable.sendMonitoringMsg();
+        }
+        return null;
+    }
+
+    public double sendThroughputMonitoringMsg() {
+        if(invokable != null) {
+            return invokable.sendThroughputMonitoringMsg();
+        }
+        return 0;
+    }
+
+    public DataDistrSplitStats sendSplitPhaseMonitoringMsg() {
+        if(invokable != null) {
+            return invokable.sendSplitPhaseMonitoringMsg();
+        }
+        return null;
+    }
+
+    public void sendStateToReceiver(Map<String, Map<Integer, StateMap<?, ?, ?>>> state,
+                                    Map<String, Map<Integer, StateMap<?, ?, ?>>> statePassiveQuery,
+                                    Map<Integer, HashMap<?, ?>> dedupMaps,
+                                    List<HeapPriorityQueueElement> triggers){
+        if(invokable != null) {
+            invokable.sendStateToReceiver(state, statePassiveQuery, dedupMaps, triggers);
+        }
+    }
+
+    public void sendStateToReceiverDownstream(Map<String, StateMap<?, ?, ?>[]> state,
+                                              HashMap<?, ?>[] dedupMaps,
+                                              HeapPriorityQueueElement[] triggers, int queueSize){
+        if(invokable != null) {
+            invokable.sendStateToReceiverDownstream(state, dedupMaps, triggers, queueSize);
+        }
+    }
+
+    public void sendSerializedStateToReceiver(Map<Integer, Map<Integer, byte[]>> state,
+                                              Map<Integer, HashMap<byte[], byte[]>> dedupMaps,
+                                              List<byte[]> triggers,
+                                              Map<Integer, Map<Integer, byte[]>> statePassiveQuery,
+                                              Map<Integer, String> stateNameDict) {
+        if(invokable != null) {
+            invokable.sendSerializedStateToReceiver(state, dedupMaps, triggers, statePassiveQuery, stateNameDict);
+        }
+    }
+
+    public void sendSerializedStateToReceiverDownstream(Map<String, byte[][]> state,
+                                                        HashMap<byte[], byte[]>[] dedupMaps,
+                                                        byte[][] triggers, int queueSize) {
+        if(invokable != null) {
+            invokable.sendSerializedStateToReceiverDownstream(state, dedupMaps, triggers, queueSize);
+        }
+    }
+
+    public void sendLastTupleData(Map<Integer, ReconfigurableSourceData> lastTupleDataMap) {
+        if(invokable != null) {
+            invokable.sendLastTupleData(lastTupleDataMap);
+        }
+    }
+
+    public void modifySourceConnection(String host, int port) {
+        if(invokable != null) {
+            invokable.modifySourceConnection(host, port) ;
+        }
+    }
 
     public void pause(){
         System.out.println("Task receives pause! current thread = "+Thread.currentThread().getName()+" "+Thread.currentThread().getId());

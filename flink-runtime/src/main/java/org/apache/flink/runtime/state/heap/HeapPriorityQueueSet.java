@@ -18,17 +18,23 @@
 
 package org.apache.flink.runtime.state.heap;
 
+import org.apache.flink.runtime.clusterframework.types.ResourceID;
 import org.apache.flink.runtime.state.KeyExtractorFunction;
 import org.apache.flink.runtime.state.KeyGroupRange;
 import org.apache.flink.runtime.state.KeyGroupRangeAssignment;
+import org.apache.flink.runtime.state.KeyGroupRangeNonContinuous;
 import org.apache.flink.runtime.state.KeyGroupedInternalPriorityQueue;
 import org.apache.flink.runtime.state.PriorityComparator;
+import org.apache.flink.util.CloseableIterator;
 
 import javax.annotation.Nonnegative;
 import javax.annotation.Nonnull;
 import javax.annotation.Nullable;
 
+import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
 import java.util.Set;
 
 import static org.apache.flink.util.Preconditions.checkArgument;
@@ -59,13 +65,13 @@ public class HeapPriorityQueueSet<T extends HeapPriorityQueueElement> extends He
      * This array contains one hash set per key-group. The sets are used for fast de-duplication and
      * deletes of elements.
      */
-    private final HashMap<T, T>[] deduplicationMapsByKeyGroup;
+    private HashMap<T, T>[] deduplicationMapsByKeyGroup;
 
     /** The key-group range of elements that are managed by this queue. */
-    private final KeyGroupRange keyGroupRange;
+    private KeyGroupRange keyGroupRange;
 
     /** The total number of key-groups of the job. */
-    private final int totalNumberOfKeyGroups;
+    private int totalNumberOfKeyGroups;
 
     /**
      * Creates an empty {@link HeapPriorityQueueSet} with the requested initial capacity.
@@ -160,12 +166,198 @@ public class HeapPriorityQueueSet<T extends HeapPriorityQueueElement> extends He
                 "%s does not contain key group %s",
                 keyGroupRange,
                 keyGroup);
-        return keyGroup - keyGroupRange.getStartKeyGroup();
+        int dop = ((KeyGroupRangeNonContinuous)keyGroupRange).getDop();
+        return (keyGroup - keyGroupRange.getStartKeyGroup()) / dop;
     }
 
     @Nonnull
     @Override
     public Set<T> getSubsetForKeyGroup(int keyGroupId) {
         return getDedupMapForKeyGroup(keyGroupId).keySet();
+    }
+
+    public Map<Integer, Map<Integer, HashMap<?, ?>>> getDeduplicationMapsForMigration(
+            int newDOP, int oldDOP, int taskIndex, int maxParallelism,
+            Map<Integer, ResourceID> partitionToResourceIDMap,
+            Map<ResourceID, Map<Integer, Map<Integer, HashMap<?, ?>>>> dedupMapsForOtherTMs,
+            List<Integer> partitionIdToTaskId) {
+        Map<Integer, Map<Integer, HashMap<?, ?>>> deduplicationMapsToMigrate = new HashMap<>(newDOP);
+        for (int pos = 0; pos < deduplicationMapsByKeyGroup.length; pos++) {
+            int keyGroupIndex = keyGroupRange.getStartKeyGroup() + pos * oldDOP;
+            //int oldPartition = getPartitionOfKeyGroup(keyGroupIndex, oldDOP, maxParallelism);
+            int newPartition = getPartitionOfKeyGroup(keyGroupIndex, newDOP);
+
+            ResourceID resourceIDofThisTask = partitionToResourceIDMap.get(taskIndex);
+            int receiverTaskIdx = partitionIdToTaskId.get(newPartition);
+            if (taskIndex != receiverTaskIdx) {
+                if (resourceIDofThisTask.equals(partitionToResourceIDMap.get(receiverTaskIdx))) {
+                    Map<Integer, HashMap<?, ?>> mapForPartition =
+                            deduplicationMapsToMigrate.computeIfAbsent(
+                                    receiverTaskIdx,
+                                    k -> new HashMap<>(deduplicationMapsByKeyGroup.length));
+                    mapForPartition
+                            .put(keyGroupIndex, deduplicationMapsByKeyGroup[pos]);
+                }
+                else {
+                    Map<Integer, Map<Integer, HashMap<?, ?>>> dedupMapsForOtherTM =
+                            dedupMapsForOtherTMs.computeIfAbsent(
+                                    resourceIDofThisTask, k -> new HashMap<>(newDOP));
+                    Map<Integer, HashMap<?, ?>> dedupMapsForPartition =
+                            dedupMapsForOtherTM.computeIfAbsent(
+                                    receiverTaskIdx, k -> new HashMap<>(deduplicationMapsByKeyGroup.length));
+                    dedupMapsForPartition
+                            .put(keyGroupIndex, deduplicationMapsByKeyGroup[pos]);
+                }
+            }
+        }
+        return deduplicationMapsToMigrate;
+    }
+
+    public HashMap<?, ?>[] getDeduplicationMapsForMigration() {
+        return deduplicationMapsByKeyGroup.clone();
+    }
+
+    public void incorporateDeduplicationMapsFromMigration(
+            Map<Integer, HashMap<T, T>> newDeduplicationMaps, int newDOP, int operatorIndex, int oldDOP) {
+        CloseableIterator<T> it = super.iterator();
+        List<T> elementsToDelete = new ArrayList<>();
+        while (it.hasNext()) {
+            T element = it.next();
+            if (element != null) {
+                int keyGroupIndex =
+                        KeyGroupRangeAssignment.assignToKeyGroup(
+                                keyExtractor.extractKeyFromElement(element), totalNumberOfKeyGroups);
+                int oldPartition = getPartitionOfKeyGroup(keyGroupIndex, oldDOP);
+                int newPartition = getPartitionOfKeyGroup(keyGroupIndex, newDOP);
+                if (oldPartition != newPartition) {
+                    elementsToDelete.add(element);
+                }
+            }
+        }
+        for (T element : elementsToDelete) {
+            super.remove(element);
+        }
+        int oldKeyGroupRangeStart = keyGroupRange.getStartKeyGroup();
+        setKeyGroupRange(newDOP, operatorIndex);
+
+        HashMap<T, T>[] newDeduplicationMapsByKeyGroup
+                = new HashMap[keyGroupRange.getNumberOfKeyGroups()];
+
+        for (int pos = 0; pos < newDeduplicationMapsByKeyGroup.length; pos++) {
+            int keyGroupIndex = keyGroupRange.getStartKeyGroup() + pos * newDOP;
+            int oldPosition = (keyGroupIndex - oldKeyGroupRangeStart) / oldDOP;
+            if (newDeduplicationMaps != null && newDeduplicationMaps.containsKey(keyGroupIndex)) {
+                newDeduplicationMapsByKeyGroup[pos] = newDeduplicationMaps.get(keyGroupIndex);
+            } else if (oldPosition >= 0 && oldPosition < deduplicationMapsByKeyGroup.length) {
+                newDeduplicationMapsByKeyGroup[pos] = deduplicationMapsByKeyGroup[oldPosition];
+            } else {
+                newDeduplicationMapsByKeyGroup[pos] = new HashMap<>();
+            }
+        }
+        this.deduplicationMapsByKeyGroup = newDeduplicationMapsByKeyGroup;
+    }
+
+    public void incorporateDeduplicationMapsFromMigration(HashMap<T, T>[] newDeduplicationMaps) {
+        this.deduplicationMapsByKeyGroup = newDeduplicationMaps;
+    }
+
+    public void addInDedupMaps(int keyGroupIndex, T elementKey, T elementVal) {
+        getDedupMapForKeyGroup(keyGroupIndex).put(elementKey, elementVal);
+    }
+
+    public Map<Integer, List<T>> getElementsForMigration(
+            int newDOP, int taskIndex, int maxParallelism,
+            Map<Integer, ResourceID> partitionToResourceIDMap,
+            Map<ResourceID, Map<Integer, List<HeapPriorityQueueElement>>> triggersForOtherTMs,
+            List<Integer> partitionIdToTaskId) {
+        Map<Integer, List<T>> elements = new HashMap<>(newDOP);
+        CloseableIterator<T> it = super.iterator();
+        List<T> elementsToDelete = new ArrayList<>();
+        while (it.hasNext()) {
+            T element = it.next();
+            if (element != null) {
+                int keyGroupIndex =
+                        KeyGroupRangeAssignment.assignToKeyGroup(
+                                keyExtractor.extractKeyFromElement(element), totalNumberOfKeyGroups);
+                //int oldPartition = getPartitionOfKeyGroup(keyGroupIndex, oldDOP, maxParallelism);
+                int newPartition = getPartitionOfKeyGroup(keyGroupIndex, newDOP);
+
+                ResourceID resourceIDofThisTask = partitionToResourceIDMap.get(taskIndex);
+                int receiverTaskIdx = partitionIdToTaskId.get(newPartition);
+                if (taskIndex != receiverTaskIdx) {
+                    if (resourceIDofThisTask.equals(partitionToResourceIDMap.get(receiverTaskIdx))) {
+                        List<T> elementsPerPartition = elements.computeIfAbsent(
+                                receiverTaskIdx, x -> new ArrayList<>());
+                        elementsPerPartition.add(element);
+                    }
+                    else {
+                        Map<Integer, List<HeapPriorityQueueElement>> triggersForOtherTM =
+                                triggersForOtherTMs.computeIfAbsent(
+                                        resourceIDofThisTask, k -> new HashMap<>(newDOP));
+                        List<HeapPriorityQueueElement> triggersForPartition =
+                                triggersForOtherTM.computeIfAbsent(
+                                        receiverTaskIdx, k -> new ArrayList<>());
+                        triggersForPartition.add(element);
+                    }
+                    elementsToDelete.add(element);
+                }
+            }
+        }
+        for (T element : elementsToDelete) {
+            super.remove(element);
+        }
+        return elements;
+    }
+
+    public T[] getElementsForMigration() {
+        return super.cloneQueue();
+    }
+
+    public int getQueueSize() {
+        return super.size();
+    }
+
+    public void incorporateElementsFromMigration(List<T> elements) {
+        if (elements == null) {
+            return;
+        }
+        for (T element : elements) {
+            add(element);
+        }
+    }
+
+    public void incorporateElementsFromMigration(T[] queue, int size) {
+        super.queue = queue;
+        super.size = size;
+    }
+
+    private void setKeyGroupRange(int parallelism, int operatorIndex) {
+        this.keyGroupRange = KeyGroupRangeAssignment.computeKeyGroupRangeForOperatorIndex(
+                totalNumberOfKeyGroups, parallelism, operatorIndex);
+    }
+
+    private int getPartitionOfKeyGroup(int keyGroupIndex, int dop) {
+        return keyGroupIndex % dop;
+    }
+
+    public void changeParallelism(int newDOP, int operatorIndex, int oldDOP) {
+        //int oldKeyGroupRangeStart = keyGroupRange.getStartKeyGroup();
+        setKeyGroupRange(newDOP, operatorIndex);
+
+        HashMap<T, T>[] newDeduplicationMapsByKeyGroup
+                = new HashMap[keyGroupRange.getNumberOfKeyGroups()];
+
+        for (int pos = 0; pos < newDeduplicationMapsByKeyGroup.length; pos++) {
+            newDeduplicationMapsByKeyGroup[pos] = new HashMap<>();
+            /*int keyGroupIndex = keyGroupRange.getStartKeyGroup() + pos * newDOP;
+            int oldPosition = (keyGroupIndex - oldKeyGroupRangeStart) / oldDOP;
+            if (oldPosition >= 0 && oldPosition < deduplicationMapsByKeyGroup.length) {
+                newDeduplicationMapsByKeyGroup[pos] = deduplicationMapsByKeyGroup[oldPosition];
+            } else {
+                newDeduplicationMapsByKeyGroup[pos] = new HashMap<>();
+            }*/
+        }
+        this.deduplicationMapsByKeyGroup = newDeduplicationMapsByKeyGroup;
+        super.clear();
     }
 }

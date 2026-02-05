@@ -73,7 +73,8 @@ public final class KeyGroupRangeAssignment {
      * @return the key-group to which the given key is assigned
      */
     public static int computeKeyGroupForKeyHash(int keyHash, int maxParallelism) {
-        return MathUtils.murmurHash(keyHash) % maxParallelism;
+        return keyHash % maxParallelism;
+        // return MathUtils.murmurHash(keyHash) % maxParallelism;
     }
 
     /**
@@ -93,7 +94,7 @@ public final class KeyGroupRangeAssignment {
     public static KeyGroupRange computeKeyGroupRangeForOperatorIndex(
             int maxParallelism, int parallelism, int operatorIndex) {
 
-        checkParallelismPreconditions(parallelism);
+        /*checkParallelismPreconditions(parallelism);
         checkParallelismPreconditions(maxParallelism);
 
         Preconditions.checkArgument(
@@ -102,7 +103,23 @@ public final class KeyGroupRangeAssignment {
 
         int start = ((operatorIndex * maxParallelism + parallelism - 1) / parallelism);
         int end = ((operatorIndex + 1) * maxParallelism - 1) / parallelism;
-        return new KeyGroupRange(start, end);
+        return new KeyGroupRange(start, end);*/
+        return computeKeyGroupRangeNonContinuousForOperatorIndex(maxParallelism, parallelism, operatorIndex);
+    }
+
+    public static KeyGroupRange computeKeyGroupRangeNonContinuousForOperatorIndex(
+            int maxParallelism, int parallelism, int operatorIndex) {
+
+        checkParallelismPreconditions(parallelism);
+        checkParallelismPreconditions(maxParallelism);
+
+        Preconditions.checkArgument(
+                maxParallelism >= parallelism,
+                "Maximum parallelism must not be smaller than parallelism.");
+
+        int start = operatorIndex;
+        int end = Math.min(maxParallelism - 1, start + ((int)Math.ceil(maxParallelism / ((double)parallelism)) - 1) * parallelism);
+        return new KeyGroupRangeNonContinuous(start, end, parallelism);
     }
 
     /**
@@ -123,7 +140,8 @@ public final class KeyGroupRangeAssignment {
      */
     public static int computeOperatorIndexForKeyGroup(
             int maxParallelism, int parallelism, int keyGroupId) {
-        return keyGroupId * parallelism / maxParallelism;
+        //return keyGroupId * parallelism / maxParallelism;
+        return keyGroupId % parallelism;
     }
 
     /**

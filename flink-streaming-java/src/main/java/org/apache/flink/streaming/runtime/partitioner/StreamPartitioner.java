@@ -78,4 +78,23 @@ public abstract class StreamPartitioner<T>
     public abstract SubtaskStateMapper getDownstreamSubtaskStateMapper();
 
     public abstract boolean isPointwise();
+
+    /**
+     * This method sets the number of output channels.
+     * Used for changing partitioning during reconfiguration.
+     * Disclaimer: This method is currently supported by KeyGroupStreamPartitioner,
+     * RebalancePartitioner and ForwardPartitioner.
+     * @param numberOfChannels
+     */
+    @Override
+    public void setNumberOfChannels(int numberOfChannels) {
+        if (this instanceof KeyGroupStreamPartitioner || this instanceof RebalancePartitioner
+                || this instanceof ForwardPartitioner) {
+            setup(numberOfChannels);
+        }
+        else {
+            throw new UnsupportedOperationException(
+                    this.getClass().getName() + " does not support setNumberOfChannels.");
+        }
+    }
 }

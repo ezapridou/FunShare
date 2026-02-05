@@ -61,4 +61,8 @@ public class SimpleTimerService implements TimerService {
     public void deleteEventTimeTimer(long time) {
         internalTimerService.deleteEventTimeTimer(VoidNamespace.INSTANCE, time);
     }
+
+    public InternalTimerService<VoidNamespace> getInternalTimerService() {
+        return internalTimerService;
+    }
 }

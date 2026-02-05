@@ -26,6 +26,8 @@ import org.apache.flink.util.Preconditions;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.slf4j.Marker;
+import org.slf4j.MarkerFactory;
 
 import javax.annotation.Nonnull;
 
@@ -82,6 +84,8 @@ import static org.apache.flink.util.Preconditions.checkNotNull;
 public abstract class RpcEndpoint implements RpcGateway, AutoCloseableAsync {
 
     protected final Logger log = LoggerFactory.getLogger(getClass());
+
+    protected static final Marker GROUP_SHARE = MarkerFactory.getMarker("GroupShare");
 
     // ------------------------------------------------------------------------
 

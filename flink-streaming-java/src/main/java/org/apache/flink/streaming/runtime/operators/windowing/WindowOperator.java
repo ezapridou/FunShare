@@ -44,10 +44,12 @@ import org.apache.flink.api.java.typeutils.TypeExtractor;
 import org.apache.flink.api.java.typeutils.runtime.TupleSerializer;
 import org.apache.flink.metrics.Counter;
 import org.apache.flink.metrics.MetricGroup;
+import org.apache.flink.runtime.clusterframework.types.ResourceID;
 import org.apache.flink.runtime.state.DefaultKeyedStateStore;
 import org.apache.flink.runtime.state.KeyedStateBackend;
 import org.apache.flink.runtime.state.VoidNamespace;
 import org.apache.flink.runtime.state.VoidNamespaceSerializer;
+import org.apache.flink.runtime.state.heap.HeapPriorityQueueElement;
 import org.apache.flink.runtime.state.internal.InternalAppendingState;
 import org.apache.flink.runtime.state.internal.InternalListState;
 import org.apache.flink.runtime.state.internal.InternalMergingState;
@@ -55,6 +57,7 @@ import org.apache.flink.streaming.api.operators.AbstractUdfStreamOperator;
 import org.apache.flink.streaming.api.operators.ChainingStrategy;
 import org.apache.flink.streaming.api.operators.InternalTimer;
 import org.apache.flink.streaming.api.operators.InternalTimerService;
+import org.apache.flink.streaming.api.operators.InternalTimerServiceImpl;
 import org.apache.flink.streaming.api.operators.OneInputStreamOperator;
 import org.apache.flink.streaming.api.operators.TimestampedCollector;
 import org.apache.flink.streaming.api.operators.Triggerable;
@@ -70,6 +73,9 @@ import org.apache.flink.util.OutputTag;
 
 import java.io.Serializable;
 import java.util.Collection;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
 
 import static org.apache.flink.util.Preconditions.checkArgument;
 import static org.apache.flink.util.Preconditions.checkNotNull;
@@ -680,6 +686,93 @@ public class WindowOperator<K, IN, ACC, OUT, W extends Window>
     /** Returns {@code true} if the given time is the cleanup time for the given window. */
     protected final boolean isCleanupTime(W window, long time) {
         return time == cleanupTime(window);
+    }
+
+    public Map<Integer, Map<Integer, HashMap<?, ?>>> getDeduplicationMapsForMigration(
+            int newDOP, int oldDOP, int taskIndex, int maxParallelism,
+            Map<Integer, ResourceID> partitionToResourceIDMap,
+            Map<ResourceID, Map<Integer, Map<Integer, HashMap<?, ?>>>> dedupMapsForOtherTMs,
+            List<Integer> partitionIdToTaskId) {
+        checkInternalTimerServiceType();
+        return ((InternalTimerServiceImpl) internalTimerService)
+                .getDeduplicationMapsForMigration(newDOP, oldDOP, taskIndex, maxParallelism,
+                        partitionToResourceIDMap, dedupMapsForOtherTMs, partitionIdToTaskId);
+    }
+
+    public HashMap<?, ?>[] getDeduplicationMapsForMigration() {
+        checkInternalTimerServiceType();
+        return ((InternalTimerServiceImpl) internalTimerService).getDeduplicationMapsForMigration();
+    }
+
+    public Map<Integer, List<HeapPriorityQueueElement>> getTriggersForMigration(
+            int newDOP, int taskIndex, int maxParallelism,
+            Map<Integer, ResourceID> partitionToResourceIDMap,
+            Map<ResourceID, Map<Integer, List<HeapPriorityQueueElement>>> triggersForOtherTMs,
+            List<Integer> partitionIdToTaskId) {
+        checkInternalTimerServiceType();
+        return ((InternalTimerServiceImpl) internalTimerService)
+                .getElementsForMigration(
+                        newDOP, taskIndex, maxParallelism, partitionToResourceIDMap,
+                        triggersForOtherTMs, partitionIdToTaskId);
+    }
+
+    public HeapPriorityQueueElement[] getTriggersForMigration() {
+        checkInternalTimerServiceType();
+        return ((InternalTimerServiceImpl) internalTimerService).getElementsForMigration();
+    }
+
+    public int getQueueSize() {
+        checkInternalTimerServiceType();
+        return ((InternalTimerServiceImpl) internalTimerService).getQueueSize();
+    }
+
+    public void incorporateReceivedWindowState(
+            Map<Integer, HashMap<?, ?>> newDeduplicationMaps,
+            List<HeapPriorityQueueElement> queueElements, int newDOP, int operatorIndex,
+            int maxParallelism, int oldDOP) {
+        checkInternalTimerServiceType();
+        ((InternalTimerServiceImpl) internalTimerService)
+                .incorporateReceivedWindowState(
+                        newDeduplicationMaps, queueElements, newDOP, operatorIndex, maxParallelism, oldDOP);
+    }
+
+    public void incorporateReceivedWindowState(
+            HashMap<HeapPriorityQueueElement, HeapPriorityQueueElement>[] deduplicationMaps,
+            HeapPriorityQueueElement[] queueElements, int queueSize) {
+        checkInternalTimerServiceType();
+        ((InternalTimerServiceImpl) internalTimerService)
+                .incorporateReceivedWindowState(deduplicationMaps, queueElements, queueSize);
+    }
+
+    public void incorporateReceivedSerializedWindowState(
+            Map<Integer, HashMap<byte[], byte[]>> dedupMaps,
+            List<byte[]> triggers) {
+        checkInternalTimerServiceType();
+        ((InternalTimerServiceImpl) internalTimerService)
+                .incorporateReceivedSerializedWindowState(dedupMaps, triggers);
+    }
+
+    public TypeSerializer getKeySerializer() {
+        checkInternalTimerServiceType();
+        return ((InternalTimerServiceImpl) internalTimerService).getKeySerializer();
+    }
+
+    public TypeSerializer getNamespaceSerializer() {
+        checkInternalTimerServiceType();
+        return ((InternalTimerServiceImpl) internalTimerService).getNamespaceSerializer();
+    }
+
+    public InternalTimerServiceImpl getInternalTimerService() {
+        checkInternalTimerServiceType();
+        return (InternalTimerServiceImpl) internalTimerService;
+    }
+
+    private void checkInternalTimerServiceType() {
+        if (!(internalTimerService instanceof InternalTimerServiceImpl)) {
+            throw new UnsupportedOperationException(
+                    "InternalTimerService is not an instance of InternalTimerServiceImpl "
+                            + "and does not support state migration.");
+        }
     }
 
     /**

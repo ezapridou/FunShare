@@ -25,10 +25,13 @@ import org.apache.flink.runtime.checkpoint.channel.ChannelStateWriter;
 import org.apache.flink.streaming.api.operators.BoundedMultiInput;
 import org.apache.flink.streaming.runtime.io.PushingAsyncDataInput.DataOutput;
 
+import org.apache.flink.streaming.runtime.tasks.StreamTask;
+
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
+import java.util.List;
 import java.util.concurrent.CompletableFuture;
 
 import static org.apache.flink.util.Preconditions.checkNotNull;
@@ -86,5 +89,24 @@ public final class StreamOneInputProcessor<IN> implements StreamInputProcessor {
     @Override
     public void close() throws IOException {
         input.close();
+    }
+
+    @Override
+    public String printClass() {
+        String res = "StreamOneInputProcessor";
+        if (input != null) {
+            res += " with input " + input.getClass().getName();
+
+        }
+        return res;
+    }
+
+    public void changeChannelsState(List<Integer> activeChannels) throws Exception {
+        if (input instanceof StreamTaskNetworkInput) {
+            ((StreamTaskNetworkInput) input).changeChannelsState(activeChannels, output);
+        }
+        else {
+            throw new UnsupportedOperationException("Cannot change channel state for input type " + input.getClass().getName());
+        }
     }
 }

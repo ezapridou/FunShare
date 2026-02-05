@@ -18,12 +18,15 @@
 
 package org.apache.flink.runtime.jobmaster;
 
-import org.apache.flink.runtime.controller.ControlMessage;
+import net.michaelkoepf.spegauge.api.sut.DataDistrSplitStats;
+
+import org.apache.flink.extensions.controller.ControlMessage;
 
 import org.apache.flink.api.common.JobID;
 import org.apache.flink.api.common.time.Time;
 import org.apache.flink.runtime.checkpoint.CheckpointOptions;
 import org.apache.flink.runtime.clusterframework.types.AllocationID;
+import org.apache.flink.extensions.controller.TaskUtilizationStats;
 import org.apache.flink.runtime.deployment.TaskDeploymentDescriptor;
 import org.apache.flink.runtime.executiongraph.ExecutionAttemptID;
 import org.apache.flink.runtime.executiongraph.PartitionInfo;
@@ -63,9 +66,27 @@ public class RpcTaskManagerGateway implements TaskManagerGateway {
     }
 
     @Override
-    public CompletableFuture<Acknowledge> sendControlToTask(
+    public CompletableFuture<?> sendControlToTask(
             ExecutionAttemptID executionAttemptID, Time timeout, ControlMessage controlMessage) {
         return taskExecutorGateway.sendControlToTask(executionAttemptID, timeout, controlMessage);
+    }
+
+    @Override
+    public CompletableFuture<TaskUtilizationStats> sendMonitoringMsgToTask(
+            ExecutionAttemptID executionAttemptID, Time timeout) {
+        return taskExecutorGateway.sendMonitoringMsgToTask(executionAttemptID, timeout);
+    }
+
+    @Override
+    public CompletableFuture<Double> sendThroughputMonitoringMsgToTask(
+            ExecutionAttemptID executionAttemptID, Time timeout) {
+        return taskExecutorGateway.sendThroughputMonitoringMsgToTask(executionAttemptID, timeout);
+    }
+
+    @Override
+    public CompletableFuture<DataDistrSplitStats> sendSplitPhaseMonitoringMsgToTask(
+            ExecutionAttemptID executionAttemptID, Time timeout) {
+        return taskExecutorGateway.sendSplitPhaseMonitoringMsgToTask(executionAttemptID, timeout);
     }
 
     @Override

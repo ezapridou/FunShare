@@ -21,8 +21,16 @@ package org.apache.flink.runtime.state.heap;
 import org.apache.flink.annotation.VisibleForTesting;
 import org.apache.flink.api.common.typeutils.TypeSerializer;
 import org.apache.flink.api.java.tuple.Tuple2;
+import org.apache.flink.core.memory.ByteArrayInputStreamWithPos;
+import org.apache.flink.core.memory.ByteArrayOutputStreamWithPos;
+import org.apache.flink.core.memory.DataInputView;
+import org.apache.flink.core.memory.DataInputViewStreamWrapper;
+import org.apache.flink.core.memory.DataOutputView;
+import org.apache.flink.core.memory.DataOutputViewStreamWrapper;
+import org.apache.flink.runtime.clusterframework.types.ResourceID;
 import org.apache.flink.runtime.state.IterableStateSnapshot;
 import org.apache.flink.runtime.state.KeyGroupRangeAssignment;
+import org.apache.flink.runtime.state.KeyGroupRangeNonContinuous;
 import org.apache.flink.runtime.state.RegisteredKeyValueStateBackendMetaInfo;
 import org.apache.flink.runtime.state.StateEntry;
 import org.apache.flink.runtime.state.StateSnapshotKeyGroupReader;
@@ -35,7 +43,10 @@ import javax.annotation.Nonnull;
 
 import java.util.Arrays;
 import java.util.Collection;
+import java.util.HashMap;
 import java.util.Iterator;
+import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 import java.util.Spliterators;
 import java.util.stream.Stream;
@@ -65,13 +76,17 @@ public abstract class StateTable<K, N, S>
     protected final TypeSerializer<K> keySerializer;
 
     /** The offset to the contiguous key groups. */
-    protected final int keyGroupOffset;
+    protected int keyGroupOffset;
+
+    protected int dop = 1;
 
     /**
      * Map for holding the actual state objects. The outer array represents the key-groups. All
      * array positions will be initialized with an empty state map.
      */
-    protected final StateMap<K, N, S>[] keyGroupedStateMaps;
+    protected StateMap<K, N, S>[] keyGroupedStateMaps;
+
+    private int operatorIndex = 99;
 
     /**
      * @param keyContext the key context provides the key scope for all put/get/delete operations.
@@ -87,6 +102,9 @@ public abstract class StateTable<K, N, S>
         this.keySerializer = Preconditions.checkNotNull(keySerializer);
 
         this.keyGroupOffset = keyContext.getKeyGroupRange().getStartKeyGroup();
+        if (keyContext.getKeyGroupRange() instanceof KeyGroupRangeNonContinuous) {
+            this.dop = ((KeyGroupRangeNonContinuous) keyContext.getKeyGroupRange()).getDop();
+        }
 
         @SuppressWarnings("unchecked")
         StateMap<K, N, S>[] state =
@@ -322,7 +340,11 @@ public abstract class StateTable<K, N, S>
 
     /** Translates a key-group id to the internal array offset. */
     private int indexToOffset(int index) {
-        return index - keyGroupOffset;
+        return (index - keyGroupOffset) / dop;
+    }
+
+    private int offsetToIndex(int offset) {
+        return offset * dop + keyGroupOffset;
     }
 
     // Meta data setter / getter and toString -----------------------------------------------------
@@ -347,12 +369,399 @@ public abstract class StateTable<K, N, S>
         this.metaInfo = metaInfo;
     }
 
+    /**
+     * This method is used for debugging purposes.
+     */
+    public String toStringCustom() {
+        String res = "StateTable: [";
+        for (StateMap<K, N, S> keyGroupedStateMap : keyGroupedStateMaps){
+            res += " StateMap: [";
+            for (Iterator<StateEntry<K, N, S>> it = keyGroupedStateMap.iterator(); it.hasNext(); ){
+                StateEntry<K, N, S> next = it.next();
+                res += " Key: " + next.getKey().toString()
+                        + " Namespace: " + next.getNamespace().getClass().getName()
+                        + " State " + next.getState().getClass().getName();
+                break;
+            }
+            res += keyGroupedStateMap.size();
+            res += "], ";
+        }
+        res += "] ";
+        return res;
+    }
+
+    public StateEntry<K, N, S> getRandomEntry() {
+        for (StateMap<K, N, S> keyGroupedStateMap : keyGroupedStateMaps) {
+            for (Iterator<StateEntry<K, N, S>> it = keyGroupedStateMap.iterator(); it.hasNext(); ) {
+                return it.next();
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Returns the entries that need to be migrated because the parallelism changed.
+     * This function will return state entries that must change the worker due to the parallelism change
+     * return type: Map<Partition, Map<keyGroupIndex, StateMap>>
+     */
+    public Map<Integer, Map<Integer, StateMap<K, ?, ?>>> getEntriesForMigration(
+            int newDOP, int taskIndex, int maxParallelism,
+            Map<Integer, ResourceID> taskToResourceIDMap,
+            Map<ResourceID, Map<Integer, Map<Integer, Map<Integer, byte[]>>>> stateForOtherTMs,
+            List<Integer> partitionIdToTaskId, int stateIdx) {
+
+        Map<Integer, Map<Integer, StateMap<K, ?, ?>>> stateToMigrate = new HashMap<>(newDOP);
+        for (int pos = 0; pos < keyGroupedStateMaps.length; pos++) {
+            int keyGroupIndex = offsetToIndex(pos);
+            //int oldPartition = getPartitionOfKeyGroup(keyGroupIndex, oldDOP, maxParallelism);
+            int newPartition = getPartitionOfKeyGroup(keyGroupIndex, newDOP, maxParallelism);
+            // System.out.println("Old partition: " + oldPartition + " New partition: " + newPartition);
+
+            ResourceID resourceIDofThisTask = taskToResourceIDMap.get(taskIndex);
+            int receiverTaskIdx = partitionIdToTaskId.get(newPartition);
+            if (taskIndex != receiverTaskIdx){
+                // this keygroup must be migrated
+                if (resourceIDofThisTask.equals(taskToResourceIDMap.get(receiverTaskIdx))){
+                    // the key group should be sent to a task in the same task manager
+                    // add it in the list for the new partition
+                    Map<Integer, StateMap<K, ?, ?>> entries = stateToMigrate.computeIfAbsent(
+                            receiverTaskIdx, k -> new HashMap<>(keyGroupedStateMaps.length));
+                    entries.put(keyGroupIndex, keyGroupedStateMaps[pos]);
+                }
+                else {
+                    // the key group should be sent to a task in a different task manager
+                    byte[] serializedState = serializeStateMap(keyGroupedStateMaps[pos]);
+                    stateForOtherTMs
+                            .computeIfAbsent(taskToResourceIDMap.get(receiverTaskIdx),
+                                    k -> new HashMap<>(newDOP))
+                            .computeIfAbsent(receiverTaskIdx,
+                                    k -> new HashMap<>(2))
+                            .computeIfAbsent(stateIdx, k -> new HashMap<>(keyGroupedStateMaps.length))
+                            .put(keyGroupIndex, serializedState);
+                }
+            }
+        }
+        return stateToMigrate;
+    }
+
+    /**
+     * Returns the entries that need to be migrated when a query moves to a group that has different
+     * filters.
+     * This function returns all state entries and then the receiver will merge the received and
+     * previous state
+     * It is used when the filter is applied on a different attribute than the one on which the state
+     * is organized.
+     * return type: Map<Partition, Map<keyGroupIndex, StateMap>>
+     * @param newDOP
+     * @param maxParallelism
+     * @return
+     */
+    public Map<Integer, Map<Integer, StateMap<K, ?, ?>>> getEntireStateForMigration(
+            int newDOP, int taskIndex, int maxParallelism,
+            Map<Integer, ResourceID> partitionToResourceIDMapActive,
+            Map<Integer, ResourceID> partitionToResourceIDMapPassive,
+            Map<ResourceID, Map<Integer, Map<Integer, Map<Integer, byte[]>>>> stateForOtherTMs,
+            List<Integer> partitionIdToTaskId, int idx) {
+        Map<Integer, Map<Integer, StateMap<K, ?, ?>>> stateToMigrate = new HashMap<>(newDOP);
+        for (int pos = 0; pos < keyGroupedStateMaps.length; pos++) {
+            int keyGroupIndex = offsetToIndex(pos);
+            int newPartition = getPartitionOfKeyGroup(keyGroupIndex, newDOP, maxParallelism);
+            //int oldPartition = getPartitionOfKeyGroup(keyGroupIndex, oldDOP, maxParallelism);
+
+            ResourceID resourceIDofThisTask = partitionToResourceIDMapPassive.get(taskIndex);
+
+            int receiverTaskIndex = partitionIdToTaskId.get(newPartition);
+            ResourceID resourceIDofReceiver = partitionToResourceIDMapActive.get(receiverTaskIndex);
+
+            if (resourceIDofReceiver.equals(resourceIDofThisTask)) {
+                // add it in the list for the new partition
+                Map<Integer, StateMap<K, ?, ?>> entries = stateToMigrate.computeIfAbsent(
+                        receiverTaskIndex,
+                        k -> new HashMap<>(keyGroupedStateMaps.length));
+                entries.put(keyGroupIndex, keyGroupedStateMaps[pos]);
+            } else {
+                // the key group should be sent to a task in a different task manager
+                byte[] serializedState = serializeStateMap(keyGroupedStateMaps[pos]);
+                stateForOtherTMs
+                        .computeIfAbsent(resourceIDofReceiver,
+                                k -> new HashMap<>(newDOP))
+                        .computeIfAbsent(receiverTaskIndex,
+                                k -> new HashMap<>(2))
+                        .computeIfAbsent(idx, k -> new HashMap<>(keyGroupedStateMaps.length))
+                        .put(keyGroupIndex, serializedState);
+            }
+        }
+        return stateToMigrate;
+    }
+
+    /**
+     * This function is used when a query moves to a group that has different filters. It returns the
+     * entries that correspond to keys that would pass the filters of the query but not the filters
+     * of the group.
+     * It is used when the filter is applied on the same attribute as the attribute on which the state
+     * is organized.
+     * This function receives the start and end of two data ranges because the dif in the data ranges
+     * between the group and the query can be in two ranges.
+     * If you want to use the function for one range only, you can set start2 to 0 and end2 to -1.
+     * @param newDOP
+     * @param maxParallelism
+     * @param start
+     * @param end
+     * @param start2
+     * @param end2
+     */
+    public Map<Integer, Map<Integer, StateMap<K, ?, ?>>> getEntriesInRangeForMigration(
+            int newDOP, int taskIndex, int maxParallelism, long start, long end, long start2, long end2,
+            Map<Integer, ResourceID> partitionToResourceIDMapActive,
+            Map<Integer, ResourceID> partitionToResourceIDMapPassive,
+            Map<ResourceID, Map<Integer, Map<Integer, Map<Integer, byte[]>>>> stateForOtherTMs,
+            List<Integer> partitionIdToTaskId, int idx) {
+        Map<Integer, Map<Integer, StateMap<K, ?, ?>>> stateToMigrate = new HashMap<>(newDOP);
+        for (int pos = 0; pos < keyGroupedStateMaps.length; pos++) {
+            int keyGroupIndex = offsetToIndex(pos);
+            int newPartition = getPartitionOfKeyGroup(keyGroupIndex, newDOP, maxParallelism);
+            //int oldPartition = getPartitionOfKeyGroup(keyGroupIndex, oldDOP, maxParallelism);
+
+            Iterator<StateEntry<K, N, S>> it = keyGroupedStateMaps[pos].iterator();
+            StateMap<K, N, S> stateMapToMigrate = createStateMap();
+            while (it.hasNext()){
+                StateEntry<K, N, S> next = it.next();
+                if (!(next.getKey() instanceof Long) && !(next.getKey() instanceof Integer)) {
+                    throw new RuntimeException(
+                            "Attempting to migrate state based on a filter range for a non-integer key");
+                }
+                long key = (long)next.getKey();
+                if ((key >= start && key <= end) || (key >= start2 && key <= end2)){
+                    // this key should be migrated
+                    stateMapToMigrate.put(next.getKey(), next.getNamespace(), next.getState());
+                }
+            }
+            if (stateMapToMigrate.size() > 0){
+                ResourceID resourceIDofThisTask = partitionToResourceIDMapPassive.get(taskIndex);
+
+                int receiverTaskIndex = partitionIdToTaskId.get(newPartition);
+                ResourceID resourceIDofReceiver = partitionToResourceIDMapActive.get(receiverTaskIndex);
+
+                if (resourceIDofReceiver.equals(resourceIDofThisTask)) {
+                    Map<Integer, StateMap<K, ?, ?>> entries = stateToMigrate.computeIfAbsent(
+                            receiverTaskIndex,
+                            k -> new HashMap<>(keyGroupedStateMaps.length));
+                    entries.put(keyGroupIndex, stateMapToMigrate);
+                } else {
+                    // the key group should be sent to a task in a different task manager
+                    byte[] serializedState = serializeStateMap(stateMapToMigrate);
+                    stateForOtherTMs
+                            .computeIfAbsent(resourceIDofReceiver,
+                                    k -> new HashMap<>(newDOP))
+                            .computeIfAbsent(receiverTaskIndex,
+                                    k -> new HashMap<>(keyGroupedStateMaps.length))
+                            .computeIfAbsent(idx, k -> new HashMap<>(keyGroupedStateMaps.length))
+                            .put(keyGroupIndex, serializedState);
+                }
+            }
+        }
+        return stateToMigrate;
+    }
+
+    /**
+     * Returns all the state maps
+     * Used for state migration among downstream operators
+     */
+    public StateMap<K, ?, ?>[] getEntriesForMigrationDownstream(
+            boolean stateMustBeSerialized,
+            Map<String, byte[][]> stateForOtherTM, String stateName) {
+        if (!stateMustBeSerialized) {
+            // this state will be sent to a task in the same task manager
+            return keyGroupedStateMaps.clone();
+        }
+        else {
+            // this state will be sent to a task in a different task manager
+            byte[][] serializedState = new byte[keyGroupedStateMaps.length][];
+            for (int pos = 0; pos < keyGroupedStateMaps.length; pos++) {
+                serializedState[pos] = serializeStateMap(keyGroupedStateMaps[pos]);
+            }
+            stateForOtherTM.put(stateName, serializedState);
+            return null;
+        }
+    }
+
+    public void incorporateReceivedState(Map<Integer, StateMap<K, ?, ?>> newStateMaps,
+                                         Map<Integer, StateMap<K, ?, ?>> newStateMapsPassiveQuery,
+                                         int newDOP, int operatorIndex) {
+        this.operatorIndex = operatorIndex;
+        int oldKeyGroupOffset = keyGroupOffset;
+        int oldDOP = dop;
+
+        this.keyContext.setKeyGroupRange(newDOP, operatorIndex);
+        this.keyGroupOffset = keyContext.getKeyGroupRange().getStartKeyGroup();
+        this.dop = newDOP;
+
+        StateMap<K, N, S>[] newKeyGroupedStateMaps = (StateMap<K, N, S>[])
+                new StateMap[keyContext.getKeyGroupRange().getNumberOfKeyGroups()];
+        for (int pos = 0; pos < newKeyGroupedStateMaps.length; pos++) {
+            int keyGroupIndex = offsetToIndex(pos);
+            int oldPosition = (keyGroupIndex - oldKeyGroupOffset) / oldDOP;
+
+            if (newStateMaps != null && newStateMaps.containsKey(keyGroupIndex)){
+                newKeyGroupedStateMaps[pos] = (StateMap<K, N, S>) newStateMaps.get(keyGroupIndex);
+            } else if (oldPosition >= 0
+                    && oldPosition < keyGroupedStateMaps.length){
+                newKeyGroupedStateMaps[pos] = keyGroupedStateMaps[oldPosition];
+            } else {
+                // this will happen when this position will get filled upon receiving the
+                // serialized state
+                newKeyGroupedStateMaps[pos] = createStateMap();
+            }
+        }
+
+        // if newStateMapsPassiveQuery is not null, then we need to aggregate it
+        if (newStateMapsPassiveQuery != null) {
+            for (int pos = 0; pos < newKeyGroupedStateMaps.length; pos++) {
+                int keyGroupIndex = offsetToIndex(pos);
+                if (newStateMapsPassiveQuery.containsKey(keyGroupIndex)){
+                    StateMap<K, N, S> stateMap = (StateMap<K, N, S>) newStateMapsPassiveQuery
+                            .get(keyGroupIndex);
+                    if (newKeyGroupedStateMaps[pos] == null){
+                        newKeyGroupedStateMaps[pos] = stateMap;
+                    } else {
+                        StateMap<K, N, S> stateMapToAggregate = stateMap;
+                        StateMap<K, N, S> stateMapToAggregateTo = newKeyGroupedStateMaps[pos];
+                        for (Iterator<StateEntry<K, N, S>> it = stateMapToAggregate.iterator(); it.hasNext(); ){
+                            StateEntry<K, N, S> next = it.next();
+                            stateMapToAggregateTo.put(next.getKey(), next.getNamespace(), next.getState());
+                        }
+                    }
+                }
+            }
+        }
+
+        // TODO GroupShare this is here for debugging
+        /*String res = "OperatorIndex: " + operatorIndex + " Key Group Range: "
+                + keyContext.getKeyGroupRange().toString() + " new StateTable: [";
+        for (StateMap<K, N, S> keyGroupedStateMap : newKeyGroupedStateMaps){
+            res += " StateMap: [";
+            for (Iterator<StateEntry<K, N, S>> it = keyGroupedStateMap.iterator(); it.hasNext(); ){
+                StateEntry<K, N, S> next = it.next();
+                res += " Key: " + next.getKey().toString()
+                        + " Namespace: " + next.getNamespace().getClass().getName()
+                        + " State " + next.getState().getClass().getName();
+                break;
+            }
+            res += "], ";
+        }
+        res += "] ";
+        System.out.println(res);*/
+        this.keyGroupedStateMaps = newKeyGroupedStateMaps;
+    }
+
+    public void incorporateReceivedState(StateMap<K, ?, ?>[] newState) {
+        this.keyGroupedStateMaps = (StateMap<K, N, S>[]) newState;
+    }
+
+    public void incorporateReceivedSerializedState(
+            Map<Integer, byte[]> newState, Map<Integer, byte[]> newStatePassiveQuery) {
+        TypeSerializer<K> keySerializer = getKeySerializer().duplicate();
+        TypeSerializer<N> namespaceSerializer = getNamespaceSerializer().duplicate();
+        TypeSerializer<S> stateSerializer = getStateSerializer().duplicate();
+
+        if (newState != null) {
+            addSerializedStateIntoStateMap(
+                    newState, keySerializer, namespaceSerializer, stateSerializer);
+        }
+        if (newStatePassiveQuery != null) {
+            addSerializedStateIntoStateMap(
+                    newStatePassiveQuery, keySerializer, namespaceSerializer, stateSerializer);
+        }
+    }
+
+    public void incorporateReceivedSerializedStateDownstream(byte[][] newState) {
+        TypeSerializer<K> keySerializer = getKeySerializer().duplicate();
+        TypeSerializer<N> namespaceSerializer = getNamespaceSerializer().duplicate();
+        TypeSerializer<S> stateSerializer = getStateSerializer().duplicate();
+
+        try {
+            for (int pos = 0; pos < newState.length; pos++) {
+                keyGroupedStateMaps[pos] = createStateMap();
+                byte[] serializedState = newState[pos];
+                        ByteArrayInputStreamWithPos inputStream = new ByteArrayInputStreamWithPos(
+                        serializedState);
+                DataInputView dataInputView = new DataInputViewStreamWrapper(inputStream);
+                int size = dataInputView.readInt();
+                for (int i = 0; i < size; i++) {
+                    N namespace = namespaceSerializer.deserialize(dataInputView);
+                    K key = keySerializer.deserialize(dataInputView);
+                    S state = stateSerializer.deserialize(dataInputView);
+                    keyGroupedStateMaps[pos].put(key, namespace, state);
+                }
+            }
+        } catch (Exception e) {
+            throw new RuntimeException("Error while deserializing state for migration", e);
+        }
+    }
+
+    private byte[] serializeStateMap(StateMap<K, N, S> stateMap) {
+        ByteArrayOutputStreamWithPos outputStream = new ByteArrayOutputStreamWithPos();
+        DataOutputView outputView = new DataOutputViewStreamWrapper(outputStream);
+        try {
+            StateMapSnapshot snapshot = stateMap.stateSnapshot();
+            snapshot.writeState(
+                    getKeySerializer().duplicate(),
+                    getNamespaceSerializer().duplicate(),
+                    getStateSerializer().duplicate(),
+                    outputView,
+                    null);
+            snapshot.release();
+        } catch (Exception e) {
+            throw new RuntimeException("Error while serializing state for migration", e);
+        }
+        return outputStream.toByteArray();
+    }
+
+    private void addSerializedStateIntoStateMap(
+            Map<Integer, byte[]> newState, TypeSerializer<K> keySerializer,
+            TypeSerializer<N> namespaceSerializer, TypeSerializer<S> stateSerializer) {
+        try{
+            for (Map.Entry<Integer, byte[]> keyGroupNewState : newState.entrySet()) {
+                int keyGroupIndex = keyGroupNewState.getKey();
+                int pos = indexToOffset(keyGroupIndex);
+                // if this assert fails, it means that we did not update correctly the parallelism
+                assert (pos >= 0 && pos < keyGroupedStateMaps.length);
+                StateMap<K, N, S> stateMap = keyGroupedStateMaps[pos];
+
+                byte[] serializedState = keyGroupNewState.getValue();
+                ByteArrayInputStreamWithPos inputStream = new ByteArrayInputStreamWithPos(
+                        serializedState);
+                DataInputView dataInputView = new DataInputViewStreamWrapper(inputStream);
+                int size = dataInputView.readInt();
+
+                for (int i = 0; i < size; i++) {
+                    N namespace = namespaceSerializer.deserialize(dataInputView);
+                    K key = keySerializer.deserialize(dataInputView);
+                    S state = stateSerializer.deserialize(dataInputView);
+                    stateMap.put(key, namespace, state);
+                }
+            }
+        } catch (Exception e) {
+            throw new RuntimeException("Error while deserializing state for migration", e);
+        }
+    }
+
     // Snapshot / Restore -------------------------------------------------------------------------
 
     public void put(K key, int keyGroup, N namespace, S state) {
         checkKeyNamespacePreconditions(key, namespace);
 
         StateMap<K, N, S> stateMap = getMapForKeyGroup(keyGroup);
+        // TODO GroupShare this is here for debugging
+        if (stateMap == null) {
+            System.out.println("StateMap null. Key: " + key.toString() + " KeyGroup: " + keyGroup
+                    + " KeyGroupRange: " + keyContext.getKeyGroupRange().toString()
+                    + " Operator index: " + operatorIndex
+                    + " KeyGroupOffset: " + keyGroupOffset
+                    + " DOP: " + dop
+                    + " StateTable size: " + keyGroupedStateMaps.length
+                    + " position: " + indexToOffset(keyGroup));
+        }
         stateMap.put(key, namespace, state);
     }
 
@@ -384,6 +793,11 @@ public abstract class StateTable<K, N, S>
     @Override
     public StateSnapshotKeyGroupReader keyGroupReader(int readVersion) {
         return StateTableByKeyGroupReaders.readerForVersion(this, readVersion);
+    }
+
+    private int getPartitionOfKeyGroup(int keyGroupIndex, int dop, int maxParallelism) {
+        //return keyGroupIndex * dop / maxParallelism;
+        return keyGroupIndex % dop;
     }
 
     // StateEntryIterator

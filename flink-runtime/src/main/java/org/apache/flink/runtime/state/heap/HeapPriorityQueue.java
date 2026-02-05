@@ -89,10 +89,15 @@ public class HeapPriorityQueue<T extends HeapPriorityQueueElement>
 
         assert removedValue.getInternalIndex() == removeIdx;
 
-        final int oldSize = size;
+        int oldSize = size;
 
         if (removeIdx != oldSize) {
             T element = heap[oldSize];
+            while (element == null) {
+                oldSize--;
+                element = heap[oldSize];
+                size--;
+            }
             moveElementToIdx(element, removeIdx);
             adjustElementAtIndex(element, removeIdx);
         }

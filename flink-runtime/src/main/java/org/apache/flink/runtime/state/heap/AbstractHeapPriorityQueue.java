@@ -139,6 +139,10 @@ public abstract class AbstractHeapPriorityQueue<T extends HeapPriorityQueueEleme
         size = 0;
     }
 
+    public T[] cloneQueue() {
+        return Arrays.copyOf(queue, queue.length);
+    }
+
     protected void resizeForBulkLoad(int totalSize) {
         if (totalSize > queue.length) {
             int desiredSize = totalSize + (totalSize >>> 3);

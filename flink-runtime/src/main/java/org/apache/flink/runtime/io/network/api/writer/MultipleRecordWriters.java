@@ -94,4 +94,8 @@ public class MultipleRecordWriters<T extends IOReadableWritable>
             recordWriter.close();
         }
     }
+
+    public int getNumberOfRecordWriters() {
+        return recordWriters.size();
+    }
 }

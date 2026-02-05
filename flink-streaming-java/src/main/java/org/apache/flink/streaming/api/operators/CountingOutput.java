@@ -20,6 +20,7 @@ package org.apache.flink.streaming.api.operators;
 
 import org.apache.flink.metrics.Counter;
 import org.apache.flink.streaming.api.watermark.Watermark;
+import org.apache.flink.streaming.runtime.io.RecordWriterOutput;
 import org.apache.flink.streaming.runtime.streamrecord.LatencyMarker;
 import org.apache.flink.streaming.runtime.streamrecord.StreamRecord;
 import org.apache.flink.util.OutputTag;
@@ -59,5 +60,28 @@ public class CountingOutput<OUT> implements Output<StreamRecord<OUT>> {
     @Override
     public void close() {
         output.close();
+    }
+
+    /**
+     * This method is used for debugging purposes.
+     * @return
+     */
+    public String getOutputClass() {
+        String outputClass = (output.getClass().getName());
+        if (output instanceof RecordWriterOutput) {
+            outputClass += " - " + ((RecordWriterOutput) output).getRecordWriterClass();
+        }
+        else {
+            outputClass += " - not a RecordWriterOutput";
+        }
+        return outputClass;
+    }
+
+    public boolean hasForwardPartitioner() {
+        if (output instanceof RecordWriterOutput) {
+            return ((RecordWriterOutput) output).hasForwardPartitioner();
+        } else {
+            return false;
+        }
     }
 }

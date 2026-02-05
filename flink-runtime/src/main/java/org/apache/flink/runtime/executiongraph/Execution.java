@@ -18,7 +18,9 @@
 
 package org.apache.flink.runtime.executiongraph;
 
-import org.apache.flink.runtime.controller.ControlMessage;
+import net.michaelkoepf.spegauge.api.sut.DataDistrSplitStats;
+
+import org.apache.flink.extensions.controller.ControlMessage;
 
 import org.apache.flink.annotation.VisibleForTesting;
 import org.apache.flink.api.common.Archiveable;
@@ -35,6 +37,7 @@ import org.apache.flink.runtime.clusterframework.types.AllocationID;
 import org.apache.flink.runtime.clusterframework.types.ResourceID;
 import org.apache.flink.runtime.concurrent.ComponentMainThreadExecutor;
 import org.apache.flink.runtime.concurrent.FutureUtils;
+import org.apache.flink.extensions.controller.TaskUtilizationStats;
 import org.apache.flink.runtime.deployment.ResultPartitionDeploymentDescriptor;
 import org.apache.flink.runtime.deployment.TaskDeploymentDescriptor;
 import org.apache.flink.runtime.deployment.TaskDeploymentDescriptorFactory;
@@ -1014,6 +1017,36 @@ public class Execution
             return taskManagerGateway.sendControlToTask(attemptId, rpcTimeout, controlMessage);
         }
         return FutureUtils.completedVoidFuture();
+    }
+
+    public CompletableFuture<TaskUtilizationStats> sendMonitoringRPCCall(){
+        final LogicalSlot slot = assignedResource;
+
+        if (slot != null) {
+            final TaskManagerGateway taskManagerGateway = slot.getTaskManagerGateway();
+            return taskManagerGateway.sendMonitoringMsgToTask(attemptId, rpcTimeout);
+        }
+        return FutureUtils.completedExceptionally(new Exception("Failed to send monitoring rpc call. No slot assigned"));
+    }
+
+    public CompletableFuture<Double> sendThroughputMonitoringRPCCall(){
+        final LogicalSlot slot = assignedResource;
+
+        if (slot != null) {
+            final TaskManagerGateway taskManagerGateway = slot.getTaskManagerGateway();
+            return taskManagerGateway.sendThroughputMonitoringMsgToTask(attemptId, rpcTimeout);
+        }
+        return FutureUtils.completedExceptionally(new Exception("Failed to send monitoring rpc call. No slot assigned"));
+    }
+
+    public CompletableFuture<DataDistrSplitStats> sendSplitPhaseMonitoringRPCCall(){
+        final LogicalSlot slot = assignedResource;
+
+        if (slot != null) {
+            final TaskManagerGateway taskManagerGateway = slot.getTaskManagerGateway();
+            return taskManagerGateway.sendSplitPhaseMonitoringMsgToTask(attemptId, rpcTimeout);
+        }
+        return FutureUtils.completedExceptionally(new Exception("Failed to send monitoring rpc call. No slot assigned"));
     }
 
     public CompletableFuture<?> sendPauseRPCCall(){

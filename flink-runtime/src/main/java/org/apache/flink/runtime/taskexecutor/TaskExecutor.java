@@ -18,11 +18,19 @@
 
 package org.apache.flink.runtime.taskexecutor;
 
-import org.apache.flink.runtime.controller.ControlMessage;
+import net.michaelkoepf.spegauge.api.sut.DataDistrSplitStats;
+import net.michaelkoepf.spegauge.api.sut.FilterDataDistrMergeStats;
+import net.michaelkoepf.spegauge.api.sut.JoinDataDistrMergeStats;
+import net.michaelkoepf.spegauge.api.sut.ReconfigurableSourceData;
+
+import org.apache.flink.extensions.controller.ControlMessage;
 
 import org.apache.flink.annotation.VisibleForTesting;
 import org.apache.flink.api.common.JobID;
 import org.apache.flink.api.common.time.Time;
+import org.apache.flink.extensions.controller.ReconfigurationControlMessage;
+import org.apache.flink.extensions.controller.StartMonitoringDataDistrControlMessage;
+import org.apache.flink.extensions.controller.StopMonitoringDataDistrControlMessage;
 import org.apache.flink.runtime.accumulators.AccumulatorSnapshot;
 import org.apache.flink.runtime.blob.BlobCacheService;
 import org.apache.flink.runtime.blob.PermanentBlobCache;
@@ -39,6 +47,7 @@ import org.apache.flink.runtime.clusterframework.types.ResourceID;
 import org.apache.flink.runtime.clusterframework.types.ResourceProfile;
 import org.apache.flink.runtime.clusterframework.types.SlotID;
 import org.apache.flink.runtime.concurrent.FutureUtils;
+import org.apache.flink.extensions.controller.TaskUtilizationStats;
 import org.apache.flink.runtime.deployment.ResultPartitionDeploymentDescriptor;
 import org.apache.flink.runtime.deployment.TaskDeploymentDescriptor;
 import org.apache.flink.runtime.entrypoint.ClusterInformation;
@@ -103,6 +112,8 @@ import org.apache.flink.runtime.state.TaskExecutorLocalStateStoresManager;
 import org.apache.flink.runtime.state.TaskLocalStateStore;
 import org.apache.flink.runtime.state.TaskStateManager;
 import org.apache.flink.runtime.state.TaskStateManagerImpl;
+import org.apache.flink.runtime.state.heap.HeapPriorityQueueElement;
+import org.apache.flink.runtime.state.heap.StateMap;
 import org.apache.flink.runtime.taskexecutor.exceptions.RegistrationTimeoutException;
 import org.apache.flink.runtime.taskexecutor.exceptions.SlotAllocationException;
 import org.apache.flink.runtime.taskexecutor.exceptions.SlotOccupiedException;
@@ -141,6 +152,9 @@ import org.apache.flink.util.StringUtils;
 import org.apache.flink.shaded.guava18.com.google.common.collect.ImmutableList;
 import org.apache.flink.shaded.guava18.com.google.common.collect.Sets;
 
+import org.json.JSONArray;
+import org.json.JSONObject;
+
 import javax.annotation.Nonnull;
 import javax.annotation.Nullable;
 
@@ -150,6 +164,10 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.lang.management.ThreadInfo;
 import java.net.InetSocketAddress;
+import java.net.*;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
@@ -268,6 +286,122 @@ public class TaskExecutor extends RpcEndpoint implements TaskExecutorGateway {
 
     private final ThreadInfoSampleService threadInfoSampleService;
 
+    // --------- reconfiguration --------
+    // initial capacity for data structures that can reach maximum size of MAX_PARALLELISM
+    private final int INITIAL_CAPACITY = 16;
+    private class ReconfData {
+        // Map<destinationPartitionID, Map<KVStateName, Map<KeyGroupIndex, keyGroupsToBeMigrated>>>
+        private final Map<Integer, Map<String, Map<Integer, StateMap<?, ?, ?>>>> stateToBeMigrated;
+        // Map<resourceIDOfReceiverTM, Map<partitionID, Map<StateNameId, Map<KeyGroupID, Set<serializedState>>>>>
+        private final Map<ResourceID, Map<Integer, Map<Integer, Map<Integer, byte[]>>>> stateForOtherTMs;
+        private Map<Integer, String> stateNameDict;
+        private final Map<Integer, Map<String, Map<Integer, StateMap<?, ?, ?>>>> stateToBeMigratedPassiveQuery;
+        private final Map<ResourceID, Map<Integer, Map<Integer, Map<Integer, byte[]>>>> stateForOtherTMsPassiveQuery;
+        // Map<destinationPartitionID, Map<KeyGroupIndex, keyGroupsToBeMigrated>>
+        private final Map<Integer, Map<Integer, HashMap<?, ?>>> dedupMapsToBeMigrated;
+        private final Map<Integer, List<HeapPriorityQueueElement>> triggersToBeMigrated;
+        private final Map<ResourceID, Map<Integer, Map<Integer, HashMap<byte[], byte[]>>>> deduplicationMapsForOtherTMs;
+        private final Map<ResourceID, Map<Integer, List<byte[]>>> triggersForOtherTMs;
+        private final List<Integer> senders;
+        private final Map<Integer, ExecutionAttemptID> receivers;
+        private int totalNumOfSenders = 0;
+        private int totalNumOfReceivers = 0;
+        private boolean multipleTMsInvolvedInReconfiguration = false;
+        private int numOfSenderTMs = 0;
+
+        public ReconfData() {
+            this.senders = new ArrayList<>(INITIAL_CAPACITY);
+            this.receivers = new HashMap<>(INITIAL_CAPACITY);
+            this.stateToBeMigrated = new HashMap<>(INITIAL_CAPACITY);
+            this.stateToBeMigratedPassiveQuery = new HashMap<>(INITIAL_CAPACITY);
+            this.stateForOtherTMs = new HashMap<>(INITIAL_CAPACITY);
+            this.stateForOtherTMsPassiveQuery = new HashMap<>(INITIAL_CAPACITY);
+            this.stateNameDict = new HashMap<>(2);
+            this.dedupMapsToBeMigrated = new HashMap<>(INITIAL_CAPACITY);
+            this.triggersToBeMigrated = new HashMap<>(INITIAL_CAPACITY);
+            this.deduplicationMapsForOtherTMs = new HashMap<>(INITIAL_CAPACITY);
+            this.triggersForOtherTMs = new HashMap<>(INITIAL_CAPACITY);
+        }
+    }
+
+    private class ReconfDataDownstream {
+        private boolean multipleTMsInvolvedInReconfigurationDownstream = false;
+        private int numOfSenderTMsForDownstream = 0;
+        private final Map<Integer, ExecutionAttemptID> downstreamReceivers;
+        // Map<destinationPartitionID, Map<KVStateName, StateMap<?, ?, ?>[]>>
+        private final Map<Integer, Map<String, StateMap<?, ?, ?>[]>> stateOfDownstream;
+        private final Map<ResourceID, Map<Integer, Map<String, byte[][]>>> stateDownstreamForOtherTMs;
+        // Map<destinationPartitionID, deduplicationMaps>
+        private final Map<Integer, HashMap<?, ?>[]> dedupMapsOfDownstream;
+        private final Map<ResourceID, Map<Integer, HashMap<byte[], byte[]>[]>> dedupMapsOfDownstreamForOtherTMs;
+        // Map<destinationPartitionID, triggers>
+        private final Map<Integer, TriggersOfDownstream> triggersOfDownstream;
+        private final Map<ResourceID, Map<Integer, byte[][]>> triggersOfDownstreamForOtherTMs;
+        private final Map<ResourceID, Map<Integer, Integer>> queueSizeOfDownstreamForOtherTMs;
+        private int totalNumOfDownstreamSenders= 0;
+        private int totalNumOfDownstreamReceivers = 0;
+
+        public ReconfDataDownstream() {
+            this.stateOfDownstream = new HashMap<>(INITIAL_CAPACITY);
+            this.dedupMapsOfDownstream = new HashMap<>(INITIAL_CAPACITY);
+            this.triggersOfDownstream = new HashMap<>(INITIAL_CAPACITY);
+            this.stateDownstreamForOtherTMs = new HashMap<>(INITIAL_CAPACITY);
+            this.dedupMapsOfDownstreamForOtherTMs = new HashMap<>(INITIAL_CAPACITY);
+            this.triggersOfDownstreamForOtherTMs = new HashMap<>(INITIAL_CAPACITY);
+            this.queueSizeOfDownstreamForOtherTMs = new HashMap<>(INITIAL_CAPACITY);
+            this.downstreamReceivers = new HashMap<>(INITIAL_CAPACITY);
+        }
+    }
+
+    private class ReconfDataSource {
+        private Map<Integer, ReconfigurableSourceData> lastTupleDataMap;
+        private final Set<ExecutionAttemptID> sourceTasksOfPasiveQuery;
+        private int totalNumOfSourcesActive = 0;
+        private int totalNumOfSourcesPassive = 0;
+        private int numOfTMsWithSources = 0;
+        private String hostOfNewDriver = "";
+        private int portOfNewDriver = 0;
+
+        public ReconfDataSource() {
+            this.lastTupleDataMap = new HashMap<>(INITIAL_CAPACITY);
+            this.sourceTasksOfPasiveQuery = new HashSet<>(INITIAL_CAPACITY);
+        }
+    }
+
+    private class PendingSerializedState {
+        private Map<Integer, Map<Integer, Map<Integer, byte[]>>> state;
+        private Map<Integer, Map<Integer, HashMap<byte[], byte[]>>> dedupMaps;
+        private Map<Integer, List<byte[]>> triggers;
+        private Map<Integer, Map<Integer, Map<Integer, byte[]>>> statePassiveQuery;
+        private Map<Integer, String> stateNameDict;
+
+        public PendingSerializedState(Map<Integer, Map<Integer, Map<Integer, byte[]>>> state,
+                                      Map<Integer, Map<Integer, HashMap<byte[], byte[]>>> dedupMaps,
+                                      Map<Integer, List<byte[]>> triggers,
+                                      Map<Integer, Map<Integer, Map<Integer, byte[]>>> statePassiveQuery,
+                                      Map<Integer, String> stateNamesDict) {
+            this.state = state;
+            this.dedupMaps = dedupMaps;
+            this.triggers = triggers;
+            this.statePassiveQuery = statePassiveQuery;
+            this.stateNameDict = stateNamesDict;
+        }
+    }
+
+    private HashMap<Integer, PendingSerializedState> pendingSerializedStatePerActiveGroup;
+
+    private ResourceID resourceIDOfThisTM = null;
+    private final int OFFSET_FOR_SENDER_ID_PASSIVE_QUERY = 10000;
+
+    private final HashMap<Integer, ReconfData> reconfDataPerActiveGroup;
+    private final List<ReconfData> reconfDataPool;
+
+    private final HashMap<Integer, ReconfDataDownstream> reconfDataPerActiveGroupDownstream;
+    private final List<ReconfDataDownstream> reconfDataPoolDownstream;
+
+    private final HashMap<Integer, ReconfDataSource> reconfDataPerActiveGroupSource;
+    private final List<ReconfDataSource> reconfDataPoolSource;
+
     public TaskExecutor(
             RpcService rpcService,
             TaskManagerConfiguration taskManagerConfiguration,
@@ -332,6 +466,26 @@ public class TaskExecutor extends RpcEndpoint implements TaskExecutorGateway {
         ScheduledExecutorService sampleExecutor =
                 Executors.newSingleThreadScheduledExecutor(sampleThreadFactory);
         this.threadInfoSampleService = new ThreadInfoSampleService(sampleExecutor);
+
+        this.reconfDataPerActiveGroup = new HashMap<>(8);
+        this.reconfDataPool = new ArrayList<>(8);
+        for (int i = 0; i < 16; i++) {
+            this.reconfDataPool.add(new ReconfData());
+        }
+
+        this.reconfDataPerActiveGroupDownstream = new HashMap<>(8);
+        this.reconfDataPoolDownstream = new ArrayList<>(8);
+        for (int i = 0; i < 16; i++) {
+            this.reconfDataPoolDownstream.add(new ReconfDataDownstream());
+        }
+
+        this.reconfDataPerActiveGroupSource = new HashMap<>(8);
+        this.reconfDataPoolSource = new ArrayList<>(8);
+        for (int i = 0; i < 16; i++) {
+            this.reconfDataPoolSource.add(new ReconfDataSource());
+        }
+
+        this.pendingSerializedStatePerActiveGroup = new HashMap<>(8);
     }
 
     private HeartbeatManager<Void, TaskExecutorHeartbeatPayload>
@@ -834,14 +988,776 @@ public class TaskExecutor extends RpcEndpoint implements TaskExecutorGateway {
     }
 
     @Override
-    public CompletableFuture<Acknowledge> sendControlToTask(
+    public CompletableFuture<?> sendControlToTask(
             ExecutionAttemptID executionAttemptID,
             Time timeout, ControlMessage controlMessage) {
         final Task task = taskSlotTable.getTask(executionAttemptID);
         if(task != null){
-            task.sendControl(controlMessage);
+            if (controlMessage instanceof ReconfigurationControlMessage
+                    || controlMessage instanceof StartMonitoringDataDistrControlMessage) {
+                task.sendControl(controlMessage);
+            } else if (controlMessage instanceof StopMonitoringDataDistrControlMessage) {
+                StopMonitoringDataDistrControlMessage stopControlMessage =
+                        (StopMonitoringDataDistrControlMessage) controlMessage;
+                if (stopControlMessage.getType() == StopMonitoringDataDistrControlMessage.Type.FILTER) {
+                    FilterDataDistrMergeStats filterDataDistrStats = task.sendStopDataDistrControlFilter((StopMonitoringDataDistrControlMessage)controlMessage);
+                    return CompletableFuture.completedFuture(filterDataDistrStats);
+                } else if (stopControlMessage.getType() == StopMonitoringDataDistrControlMessage.Type.JOIN) {
+                    JoinDataDistrMergeStats joinDataDistrStats = task.sendStopDataDistrControlJoin((StopMonitoringDataDistrControlMessage)controlMessage);
+                    return CompletableFuture.completedFuture(joinDataDistrStats);
+                }
+
+            } else {
+                throw new RuntimeException("Unsupported control message type");
+            }
         }
         return CompletableFuture.completedFuture(Acknowledge.get());
+    }
+
+    public CompletableFuture<TaskUtilizationStats> sendMonitoringMsgToTask(
+            ExecutionAttemptID executionAttemptID,
+            Time timeout) {
+        final Task task = taskSlotTable.getTask(executionAttemptID);
+        if(task != null){
+            TaskUtilizationStats metrics = task.sendMonitoringMsg();
+            return CompletableFuture.completedFuture(metrics);
+        }
+        throw new RuntimeException("Attempting to send monitoring message to a task that is not in"
+                + "the task slot table.");
+    }
+
+    public CompletableFuture<Double> sendThroughputMonitoringMsgToTask(
+            ExecutionAttemptID executionAttemptID,
+            Time timeout
+    ) {
+        final Task task = taskSlotTable.getTask(executionAttemptID);
+        if(task != null){
+            double throughput = task.sendThroughputMonitoringMsg();
+            return CompletableFuture.completedFuture(throughput);
+        }
+        throw new RuntimeException("Attempting to send monitoring message to a task that is not in"
+                + "the task slot table.");
+    }
+
+    public CompletableFuture<DataDistrSplitStats> sendSplitPhaseMonitoringMsgToTask(
+            ExecutionAttemptID executionAttemptID,
+            Time timeout
+    ) {
+        final Task task = taskSlotTable.getTask(executionAttemptID);
+        if(task != null){
+            DataDistrSplitStats splitStats = task.sendSplitPhaseMonitoringMsg();
+            return CompletableFuture.completedFuture(splitStats);
+        }
+        throw new RuntimeException("Attempting to send monitoring message to a task that is not in"
+                + "the task slot table.");
+    }
+
+    private synchronized boolean tryToSendState(int activeGroupID){
+        ReconfData reconfData = reconfDataPerActiveGroup.get(activeGroupID);
+        log.debug(GROUP_SHARE, "State migration: Task Manager is trying to send the state. "
+                + "Active group ID: " + activeGroupID +
+                " sendersTotal: " + reconfData.totalNumOfSenders +
+                " sendersSoFar: " + reconfData.senders.size() +
+                " receiversTotal: " + reconfData.totalNumOfReceivers +
+                " receiversSoFar: " + reconfData.receivers.size());
+        if (reconfData.totalNumOfSenders > reconfData.senders.size() ||
+                reconfData.totalNumOfReceivers > reconfData.receivers.size()){
+            // not all servers and receivers have notified the task manager yet
+            return false;
+        }
+
+        for (Map.Entry<Integer, ExecutionAttemptID> receiver : reconfData.receivers.entrySet()){
+            final Task receiverTask = taskSlotTable.getTask(receiver.getValue());
+            if (receiverTask == null){
+                throw new RuntimeException("Receiver task not found in the task slot table");
+                // maybe this can happen if I terminate a job while the state migration is ongoing and
+                // then start a new job
+            }
+            receiverTask.sendStateToReceiver(reconfData.stateToBeMigrated.get(receiver.getKey()),
+                    reconfData.stateToBeMigratedPassiveQuery.get(receiver.getKey()),
+                    reconfData.dedupMapsToBeMigrated.get(receiver.getKey()),
+                    reconfData.triggersToBeMigrated.get(receiver.getKey()));
+            log.debug(GROUP_SHARE, "State migration: Task Manager sent the state to the receiver"
+                    + " active-id " + activeGroupID);
+        }
+
+        if (reconfData.multipleTMsInvolvedInReconfiguration) {
+            if (jobTable.getJobs().size() == 1) {
+                //log.debug(GROUP_SHARE, "Sending state to job master");
+
+                JobMasterGateway jobMasterGateway = getJobMasterGateway();
+
+                if (log.isDebugEnabled(GROUP_SHARE)) {
+                    //compute the memory size of stateForOtherTMs
+                    long sizeOfStateForOtherTMs = sizeOfState(reconfData.stateForOtherTMs);
+                    long sizeOfStateForOtherTMsPassiveQuery = sizeOfState(reconfData.stateForOtherTMsPassiveQuery);
+                    long sizeOfDedupMapsForOtherTMs = sizeOfDedupMaps(reconfData.deduplicationMapsForOtherTMs);
+                    long sizeOfTriggers = sizeOfTriggers(reconfData.triggersForOtherTMs);
+                    long sizeOfStateNameDict = 68
+                            * reconfData.stateNameDict.size(); // 64 would be the approx size for a 10 character string + 4 for the key
+                    log.debug(GROUP_SHARE, "Size of state for JobMaster: " + sizeOfStateForOtherTMs + " " +
+                            sizeOfStateForOtherTMsPassiveQuery + " " + sizeOfDedupMapsForOtherTMs
+                            + " " +
+                            sizeOfTriggers + " " + sizeOfStateNameDict + " total " +
+                            (sizeOfStateForOtherTMs + sizeOfStateForOtherTMsPassiveQuery
+                                    + sizeOfDedupMapsForOtherTMs + sizeOfTriggers
+                                    + sizeOfStateNameDict + 4));
+                }
+
+                Map<ResourceID, Map<Integer, Map<Integer, Map<Integer, byte[]>>>>[] stateDividedInFour = new Map[4];
+                for (int i = 0; i < 4; i++) {
+                    stateDividedInFour[i] = new HashMap<>();
+                }
+
+                for (Map.Entry<ResourceID, Map<Integer, Map<Integer, Map<Integer, byte[]>>>> entry :
+                        reconfData.stateForOtherTMs.entrySet()) {
+                    for (int i = 0; i < 4; i++) {
+                        stateDividedInFour[i].put(entry.getKey(), new HashMap<>());
+                    }
+                    int i = 0;
+                    for (Map.Entry<Integer, Map<Integer, Map<Integer, byte[]>>> entry2 : entry
+                            .getValue()
+                            .entrySet()) {
+                        int index = i % 4;
+                        stateDividedInFour[index].get(entry.getKey()).put(entry2.getKey(), entry2.getValue());
+                        i++;
+                    }
+                }
+
+                //jobMasterGateway.sendStateOnlyToJobMaster(stateForOtherTMs, numOfSenderTMs);
+                for (int i = 0; i < 4; i++) {
+                    jobMasterGateway.sendStateOnlyToJobMaster(stateDividedInFour[i],
+                            reconfData.stateNameDict, reconfData.numOfSenderTMs, activeGroupID);
+                }
+                jobMasterGateway.sendDedupMapsToJobMaster(
+                        reconfData.deduplicationMapsForOtherTMs, reconfData.numOfSenderTMs, activeGroupID);
+                jobMasterGateway.sendTriggersToJobMaster(
+                        reconfData.triggersForOtherTMs, reconfData.numOfSenderTMs, activeGroupID);
+                jobMasterGateway.sendStatePassiveToJobMaster(
+                        reconfData.stateForOtherTMsPassiveQuery,
+                        reconfData.stateNameDict, reconfData.numOfSenderTMs, activeGroupID);
+
+                log.debug(GROUP_SHARE, "State migration: Task Manager sent the serialized state to the job master"
+                        + " active-id " + activeGroupID);
+            } else {
+                throw new RuntimeException(
+                        "More than one job found in the job table. We do not support"
+                                + " multiple jobs.");
+            }
+        }
+        if (!reconfData.multipleTMsInvolvedInReconfiguration || reconfData.receivers.isEmpty()) {
+            clearStateMigrationDataStructures(activeGroupID);
+        }
+        if (pendingSerializedStatePerActiveGroup.containsKey(activeGroupID)) {
+            PendingSerializedState pendingState = pendingSerializedStatePerActiveGroup.get(activeGroupID);
+            sendSerializedStateToReceivers(reconfData, pendingState.state, pendingState.dedupMaps,
+                    pendingState.triggers, pendingState.statePassiveQuery, pendingState.stateNameDict,
+                    activeGroupID);
+        }
+
+        return true;
+    }
+
+    private long sizeOfState(Map<ResourceID, Map<Integer, Map<Integer, Map<Integer, byte[]>>>> state){
+        long size = 0;
+        for (Map.Entry<ResourceID, Map<Integer, Map<Integer, Map<Integer, byte[]>>>> entry : state.entrySet()) {
+            // size of resource id
+            size += entry.getKey().getResourceID().toString().length() * 2 +
+                    entry.getKey().getMetadata().length() * 2 + 8;
+            for (Map.Entry<Integer, Map<Integer, Map<Integer, byte[]>>> entry2 : entry.getValue().entrySet()) {
+                // size of partition id
+                size += 4;
+                for (Map.Entry<Integer, Map<Integer, byte[]>> entry3 : entry2.getValue().entrySet()) {
+                    // size of state name id
+                    size += 4;
+                    for (Map.Entry<Integer, byte[]> entry4 : entry3.getValue().entrySet()) {
+                        // size of key group state
+                        size += 4 + entry4.getValue().length;
+                    }
+                }
+            }
+        }
+
+        return size;
+    }
+
+    private long sizeOfDedupMaps( Map<ResourceID, Map<Integer, Map<Integer, HashMap<byte[], byte[]>>>> dedupMaps) {
+        long size = 0;
+        for (Map.Entry<ResourceID, Map<Integer, Map<Integer, HashMap<byte[], byte[]>>>>
+                entry : dedupMaps.entrySet()) {
+            size += entry.getKey().getResourceID().toString().length() * 2 +
+                    entry.getKey().getMetadata().length() * 2 + 8;
+            for (Map.Entry<Integer, Map<Integer, HashMap<byte[], byte[]>>> entry2 : entry.getValue().entrySet()) {
+                size += 4;
+                for (Map.Entry<Integer, HashMap<byte[], byte[]>> entry3 : entry2.getValue().entrySet()) {
+                    size += 4;
+                    for (Map.Entry<byte[], byte[]> entry4 : entry3.getValue().entrySet()) {
+                        size += entry4.getKey().length + entry4.getValue().length;
+                    }
+                }
+            }
+        }
+        return size;
+    }
+
+    private long sizeOfTriggers(Map<ResourceID, Map<Integer, List<byte[]>>> triggers) {
+        long size = 0;
+        for (Map.Entry<ResourceID, Map<Integer, List<byte[]>>> entry : triggers.entrySet()) {
+            size += entry.getKey().getResourceID().toString().length() * 2 +
+                    entry.getKey().getMetadata().length() * 2 + 8;
+            for (Map.Entry<Integer, List<byte[]>> entry2 : entry.getValue().entrySet()) {
+                size += 4;
+                for (byte[] trigger : entry2.getValue()) {
+                    size += trigger.length;
+                }
+            }
+        }
+        return size;
+    }
+
+    private JobMasterGateway getJobMasterGateway() {
+        JobID jobId = jobTable.getJobs().iterator().next().getJobId();
+        JobTable.Connection jobManagerConnection = jobTable.getConnection(jobId)
+                .orElseThrow(() -> new RuntimeException("JobManager connection not found"));
+        return jobManagerConnection.getJobManagerGateway();
+    }
+
+    private void clearStateMigrationDataStructures(int activeGroupId) {
+        ReconfData reconfData = reconfDataPerActiveGroup.get(activeGroupId);
+        reconfData.senders.clear();
+        reconfData.receivers.clear();
+        reconfData.totalNumOfSenders = 0;
+        reconfData.totalNumOfReceivers = 0;
+        reconfData.stateToBeMigrated.clear();
+        reconfData.stateToBeMigratedPassiveQuery.clear();
+        reconfData.dedupMapsToBeMigrated.clear();
+        reconfData.triggersToBeMigrated.clear();
+        reconfData.stateForOtherTMs.clear();
+        reconfData.stateForOtherTMsPassiveQuery.clear();
+        reconfData.stateNameDict.clear();
+        reconfData.deduplicationMapsForOtherTMs.clear();
+        reconfData.triggersForOtherTMs.clear();
+        reconfData.multipleTMsInvolvedInReconfiguration = false;
+        reconfData.numOfSenderTMs = 0;
+        reconfDataPool.add(reconfDataPerActiveGroup.remove(activeGroupId));
+    }
+
+    private synchronized boolean tryToSendStateDownstream(int activeGroupID){
+        ReconfDataDownstream reconfData = reconfDataPerActiveGroupDownstream.get(activeGroupID);
+        if (reconfData.totalNumOfDownstreamSenders > reconfData.stateOfDownstream.size() ||
+                reconfData.totalNumOfDownstreamReceivers > reconfData.downstreamReceivers.size() ||
+                reconfData.totalNumOfDownstreamReceivers == 0 || reconfData.totalNumOfDownstreamSenders == 0) {
+            // not all servers and receivers have notified the task manager yet
+            return false;
+        }
+        // first send the state to the tasks that are on the same TM
+        for (Map.Entry<Integer, ExecutionAttemptID> receiver : reconfData.downstreamReceivers.entrySet()) {
+            final Task receiverTask = taskSlotTable.getTask(receiver.getValue());
+            HeapPriorityQueueElement[] triggers = null;
+            int queueSize = 0;
+            if (reconfData.triggersOfDownstream.containsKey(receiver.getKey())) {
+                triggers = reconfData.triggersOfDownstream.get(receiver.getKey()).triggers;
+                queueSize = reconfData.triggersOfDownstream.get(receiver.getKey()).queueSize;
+            }
+            receiverTask.sendStateToReceiverDownstream(reconfData.stateOfDownstream.get(receiver.getKey()),
+                    reconfData.dedupMapsOfDownstream.get(receiver.getKey()), triggers, queueSize);
+            log.debug(GROUP_SHARE, "State migration: Task Manager sent the state to the downstream receiver");
+        }
+        if (reconfData.multipleTMsInvolvedInReconfigurationDownstream) {
+            if (jobTable.getJobs().size() == 1) {
+                log.debug(GROUP_SHARE, "Sending downstream state to job master");
+
+                JobMasterGateway jobMasterGateway = getJobMasterGateway();
+
+                // send state
+                jobMasterGateway.sendStateToJobMasterDownstream(
+                        reconfData.stateDownstreamForOtherTMs, reconfData.dedupMapsOfDownstreamForOtherTMs,
+                        reconfData.triggersOfDownstreamForOtherTMs, reconfData.queueSizeOfDownstreamForOtherTMs,
+                        reconfData.numOfSenderTMsForDownstream, activeGroupID);
+
+                log.debug(GROUP_SHARE, "State migration: Task Manager sent the serialized downstream state to the jobmaster");
+            } else {
+                throw new RuntimeException(
+                        "More than one job found in the job table. We do not support"
+                                + " multiple jobs.");
+            }
+        }
+        else {
+            clearStateMigrationDataStructuresDownstream(activeGroupID);
+        }
+
+        return true;
+    }
+
+    private void clearStateMigrationDataStructuresDownstream(int activeGroupId) {
+        ReconfDataDownstream reconfData = reconfDataPerActiveGroupDownstream.get(activeGroupId);
+        // clear/initialize data structures
+        reconfData.downstreamReceivers.clear();
+        reconfData.totalNumOfDownstreamSenders = 0;
+        reconfData.totalNumOfDownstreamReceivers = 0;
+        reconfData.stateOfDownstream.clear();
+        reconfData.dedupMapsOfDownstream.clear();
+        reconfData.triggersOfDownstream.clear();
+        reconfData.stateDownstreamForOtherTMs.clear();
+        reconfData.dedupMapsOfDownstreamForOtherTMs.clear();
+        reconfData.triggersOfDownstreamForOtherTMs.clear();
+        reconfData.queueSizeOfDownstreamForOtherTMs.clear();
+        reconfData.numOfSenderTMsForDownstream = 0;
+        reconfData.multipleTMsInvolvedInReconfigurationDownstream = false;
+        reconfDataPoolDownstream.add(reconfDataPerActiveGroupDownstream.remove(activeGroupId));
+    }
+
+    private void saveReceiver(int receiverId, ExecutionAttemptID executionAttemptID, ReconfData reconfData) {
+        assert !reconfData.receivers.containsKey(receiverId);
+        reconfData.receivers.put(receiverId, executionAttemptID);
+    }
+
+    private void saveSender(int senderId, ReconfData reconfData) {
+        assert !reconfData.senders.contains(senderId);
+        reconfData.senders.add(senderId);
+    }
+
+    private void saveDownstreamReceiver(
+            int receiverId, ExecutionAttemptID executionAttemptID, ReconfDataDownstream reconfData) {
+        assert !reconfData.downstreamReceivers.containsKey(receiverId);
+        reconfData.downstreamReceivers.put(receiverId, executionAttemptID);
+    }
+
+    private void setNumOfSourcesActive(int numOfSources, ReconfDataSource reconfData){
+        // the following asserts that either the totalNumOfSourcesActive has not been set or it has been
+        // set by another source to the same value
+        assert reconfData.totalNumOfSourcesActive == 0 || reconfData.totalNumOfSourcesActive == numOfSources;
+        reconfData.totalNumOfSourcesActive = numOfSources;
+    }
+
+    private void setNumOfSourcesPassive(int numOfSources, ReconfDataSource reconfData){
+        // the following asserts that either the totalNumOfSourcesPassive has not been set or it has been
+        // set by another source to the same value
+        assert reconfData.totalNumOfSourcesPassive == 0 || reconfData.totalNumOfSourcesPassive == numOfSources;
+        reconfData.totalNumOfSourcesPassive = numOfSources;
+    }
+
+    private void setNumOfTMsSources(int numOfTMs, ReconfDataSource reconfData){
+        // we take the max from TMs of active and passive query
+        if (reconfData.numOfTMsWithSources < numOfTMs) {
+            reconfData.numOfTMsWithSources = numOfTMs;
+        }
+    }
+
+    private void setResourceId(ResourceID resourceId){
+        this.resourceIDOfThisTM = resourceId;
+    }
+
+    private void setNumOfReceivers(int numOfReceivers, ReconfData reconfData){
+        // the following asserts that either the totalNumOfReceivers has not been set or it has been
+        // set by another receiver to the same value
+        assert reconfData.totalNumOfReceivers == 0 || reconfData.totalNumOfReceivers == numOfReceivers;
+        reconfData.totalNumOfReceivers = numOfReceivers;
+    }
+
+    private void setNumOfSenders(int numOfSenders, ReconfData reconfData) {
+        // the following asserts that either the totalNumOfSenders has not been set or it has been
+        // set by another receiver to the same value
+        assert reconfData.totalNumOfSenders == 0 || reconfData.totalNumOfSenders == numOfSenders;
+        reconfData.totalNumOfSenders = numOfSenders;
+    }
+
+    private void setNumOfDownstreamReceivers(int numOfReceivers, ReconfDataDownstream reconfData){
+        // the following asserts that either the totalNumOfDownstreamReceivers has not been set or it has been
+        // set by another receiver to the same value
+        assert reconfData.totalNumOfDownstreamReceivers == 0 || reconfData.totalNumOfDownstreamReceivers == numOfReceivers;
+        reconfData.totalNumOfDownstreamReceivers = numOfReceivers;
+    }
+
+    private void setNumOfDownstreamSenders(int numOfSenders, ReconfDataDownstream reconfData) {
+        // the following asserts that either the totalNumOfSenders has not been set or it has been
+        // set by another receiver to the same value
+        assert reconfData.totalNumOfDownstreamSenders == 0 || reconfData.totalNumOfDownstreamSenders == numOfSenders;
+        reconfData.totalNumOfDownstreamSenders = numOfSenders;
+    }
+
+    private void addState(Map<Integer, Map<String, Map<Integer, StateMap<?, ?, ?>>>> newState,
+                          Map<Integer, Map<String, Map<Integer, StateMap<?, ?, ?>>>> aggrState) {
+        for (Map.Entry<Integer, Map<String, Map<Integer, StateMap<?, ?, ?>>>> perPartitionNewState : newState.entrySet()){
+            Map<String, Map<Integer, StateMap<?, ?, ?>>> perPartitionState = aggrState
+                    .computeIfAbsent(perPartitionNewState.getKey(), x -> new HashMap<>());
+            for (Map.Entry<String, Map<Integer, StateMap<?, ?, ?>>> KVStateMap : perPartitionNewState.getValue().entrySet())
+            {
+                perPartitionState.computeIfAbsent(KVStateMap.getKey(), x -> new HashMap<>()).putAll(KVStateMap.getValue());
+            }
+        }
+    }
+
+    private void addStateForOtherTMs(
+            Map<ResourceID, Map<Integer, Map<Integer, Map<Integer, byte[]>>>> newState,
+            Map<ResourceID, Map<Integer, Map<Integer, Map<Integer, byte[]>>>> aggrState,
+            Map<Integer, String> stateNames, ReconfData reconfData) {
+        for (Map.Entry<ResourceID, Map<Integer, Map<Integer, Map<Integer, byte[]>>>> perResourceNewState :
+                newState.entrySet()) {
+            Map<Integer, Map<Integer, Map<Integer, byte[]>>> perResourceState = aggrState
+                    .computeIfAbsent(perResourceNewState.getKey(), x -> new HashMap<>());
+            for (Map.Entry<Integer, Map<Integer, Map<Integer, byte[]>>> perPartitionNewState :
+                    perResourceNewState.getValue().entrySet()){
+                Map<Integer, Map<Integer, byte[]>> perPartitionState = perResourceState
+                        .computeIfAbsent(perPartitionNewState.getKey(), x -> new HashMap<>());
+                for (Map.Entry<Integer, Map<Integer, byte[]>> perStateNameNewState :
+                        perPartitionNewState.getValue().entrySet()){
+                    String stateName = stateNames.get(perStateNameNewState.getKey());
+                    int stateId = getStateIdFromString(stateName, reconfData);
+                    Map<Integer, byte[]> perStateNameState = perPartitionState
+                            .computeIfAbsent(stateId, x -> new HashMap<>());
+                    for (Map.Entry<Integer, byte[]> perKeyGroupNewState : perStateNameNewState.getValue().entrySet()) {
+                        perStateNameState.put(perKeyGroupNewState.getKey(), perKeyGroupNewState.getValue());
+                    }
+                }
+            }
+        }
+    }
+
+    private int getStateIdFromString(String stateName, ReconfData reconfData) {
+        for (Map.Entry<Integer, String> entry : reconfData.stateNameDict.entrySet()) {
+            if (entry.getValue().equals(stateName)) {
+                return entry.getKey();
+            }
+        }
+        // if not found
+        int maxKey = -1;
+        for (Map.Entry<Integer, String> entry : reconfData.stateNameDict.entrySet()) {
+            if (entry.getKey() > maxKey) {
+                maxKey = entry.getKey();
+            }
+        }
+        reconfData.stateNameDict.put(maxKey + 1, stateName);
+        return maxKey + 1;
+    }
+
+    private void saveStateToBeMigrated(
+            Map<Integer, Map<String, Map<Integer, StateMap<?, ?, ?>>>> newState, ReconfData reconfData) {
+        // aggregate the newly received state into stateToBeMigrated
+        addState(newState, reconfData.stateToBeMigrated);
+    }
+
+    private void saveStateForOtherTMsToBeMigrated(
+            Map<ResourceID, Map<Integer, Map<Integer, Map<Integer, byte[]>>>> newState,
+            Map<Integer, String> stateNameDict, ReconfData reconfData) {
+        if (reconfData.stateNameDict.isEmpty()){
+            reconfData.stateNameDict = stateNameDict;
+        }
+        // aggregate the newly received state into stateToBeMigrated
+        addStateForOtherTMs(newState, reconfData.stateForOtherTMs, stateNameDict, reconfData);
+    }
+
+    private void saveStateToBeMigratedPassiveQuery(
+            Map<Integer, Map<String, Map<Integer, StateMap<?, ?, ?>>>> newState,
+            ReconfData reconfData) {
+        addState(newState, reconfData.stateToBeMigratedPassiveQuery);
+    }
+
+    private void saveStateForOtherTMsToBeMigratedPassive(
+            Map<ResourceID, Map<Integer, Map<Integer, Map<Integer, byte[]>>>> newState,
+            Map<Integer, String> stateNameDict, ReconfData reconfData) {
+        if (reconfData.stateNameDict.isEmpty()){
+            reconfData.stateNameDict = stateNameDict;
+        }
+        addStateForOtherTMs(newState, reconfData.stateForOtherTMsPassiveQuery, stateNameDict, reconfData);
+    }
+
+    private void saveStateToBeMigratedDownstream(
+            int senderId, Map<String, StateMap<?, ?, ?>[]> stateOfDownstream, ReconfDataDownstream reconfData) {
+        // Note that the sender and receiver id in this case are the same
+        assert reconfData.stateOfDownstream.get(senderId) == null;
+        reconfData.stateOfDownstream.put(senderId, stateOfDownstream);
+    }
+
+    private void saveStateToBeMigratedDownstreamForOtherTMs(
+            int senderId, Map<String, byte[][]> serializedStateOfDownstream,
+            ResourceID receiverTMId, ReconfDataDownstream reconfData) {
+        // Note that the sender and receiver id in this case are the same
+        assert reconfData.stateDownstreamForOtherTMs.get(senderId) == null;
+        reconfData.stateDownstreamForOtherTMs.computeIfAbsent(receiverTMId, x -> new HashMap<>(16))
+                .put(senderId, serializedStateOfDownstream);
+    }
+
+    private void saveWindowStateToBeMigrated(
+            Map<Integer, Map<Integer, HashMap<?,?>>> dedupMaps,
+            Map<Integer, List<HeapPriorityQueueElement>> triggers, ReconfData reconfData) {
+        for (Map.Entry<Integer, Map<Integer, HashMap<?, ?>>> perPartitionNewState : dedupMaps.entrySet()) {
+            Map<Integer, HashMap<?, ?>> perPartitionState = reconfData.dedupMapsToBeMigrated
+                    .computeIfAbsent(perPartitionNewState.getKey(), x -> new HashMap<>());
+            perPartitionState.putAll(perPartitionNewState.getValue());
+        }
+        for (Map.Entry<Integer, List<HeapPriorityQueueElement>> perPartitionNewState : triggers.entrySet()){
+            List<HeapPriorityQueueElement> perPartitionState = reconfData.triggersToBeMigrated.computeIfAbsent(
+                    perPartitionNewState.getKey(), x -> new ArrayList<>());
+            perPartitionState.addAll(perPartitionNewState.getValue());
+        }
+    }
+
+    private void saveWindowStateForOtherTMsToBeMigrated(
+            Map<ResourceID, Map<Integer, Map<Integer, HashMap<byte[], byte[]>>>> deduplicationMapsForOtherTMs,
+            Map<ResourceID, Map<Integer, List<byte[]>>> triggersForOtherTMs, ReconfData reconfData) {
+        for (Map.Entry<ResourceID, Map<Integer, Map<Integer, HashMap<byte[], byte[]>>>>
+                perTMNewState : deduplicationMapsForOtherTMs.entrySet()) {
+            Map<Integer, Map<Integer, HashMap<byte[], byte[]>>> perTMState =
+                    reconfData.deduplicationMapsForOtherTMs.computeIfAbsent(perTMNewState.getKey(), x -> new HashMap<>());
+            for (Map.Entry<Integer, Map<Integer, HashMap<byte[], byte[]>>> perPartitionNewState :
+                perTMNewState.getValue().entrySet()) {
+                Map<Integer, HashMap<byte[], byte[]>> perPartitionState = perTMState
+                        .computeIfAbsent(perPartitionNewState.getKey(), x -> new HashMap<>());
+                perPartitionState.putAll(perPartitionNewState.getValue());
+            }
+        }
+
+        for (Map.Entry<ResourceID, Map<Integer, List<byte[]>>> perTMNewState : triggersForOtherTMs.entrySet()) {
+            Map<Integer, List<byte[]>> perTMState = reconfData.triggersForOtherTMs.computeIfAbsent(perTMNewState.getKey(), x -> new HashMap<>());
+            for (Map.Entry<Integer, List<byte[]>> perPartitionNewState : perTMNewState.getValue().entrySet()) {
+                List<byte[]> perPartitionState = perTMState.computeIfAbsent(perPartitionNewState.getKey(), x -> new ArrayList<>());
+                perPartitionState.addAll(perPartitionNewState.getValue());
+            }
+        }
+    }
+
+    private void saveWindowStateToBeMigratedDownstream(
+            int senderId, HashMap<?, ?>[] dedupMapsOfDownstream,
+            HeapPriorityQueueElement[] triggersOfDownstream, int queueSize,
+            ReconfDataDownstream reconfData) {
+        // Note that the sender and receiver id in this case are the same
+        assert reconfData.dedupMapsOfDownstream.get(senderId) == null;
+        reconfData.dedupMapsOfDownstream.put(senderId, dedupMapsOfDownstream);
+        assert reconfData.triggersOfDownstream.get(senderId) == null;
+        reconfData.triggersOfDownstream.put(senderId, new TriggersOfDownstream(triggersOfDownstream, queueSize));
+    }
+
+    private void saveWindowStateToBeMigratedDownstreamForOtherTMs(
+            int senderId, HashMap<byte[], byte[]>[] dedupMapsForOtherTMs,
+            byte[][] triggersForOtherTMs, int queueSize, ResourceID receiverTMId, ReconfDataDownstream reconfData) {
+        // Note that the sender and receiver id in this case are the same
+        assert reconfData.dedupMapsOfDownstreamForOtherTMs.get(senderId) == null;
+        reconfData.dedupMapsOfDownstreamForOtherTMs.computeIfAbsent(receiverTMId, x -> new HashMap<>(16))
+                .put(senderId, dedupMapsForOtherTMs);
+
+        assert reconfData.triggersOfDownstreamForOtherTMs.get(senderId) == null;
+        reconfData.triggersOfDownstreamForOtherTMs.computeIfAbsent(receiverTMId, x -> new HashMap<>(16))
+                .put(senderId, triggersForOtherTMs);
+        reconfData.queueSizeOfDownstreamForOtherTMs.computeIfAbsent(receiverTMId, x -> new HashMap<>(16))
+                .put(senderId, queueSize);
+    }
+
+    private void setConfigForMultiTMs(
+            boolean stateMigrationInvolvingManyTMs, int numOfSenderTMs, ReconfData reconfData) {
+        assert reconfData.numOfSenderTMs == 0 || reconfData.numOfSenderTMs == numOfSenderTMs;
+        reconfData.numOfSenderTMs = numOfSenderTMs;
+        reconfData.multipleTMsInvolvedInReconfiguration = stateMigrationInvolvingManyTMs;
+    }
+
+    private void setConfigForMultiTMsDownstream(
+            boolean stateMigrationInvolvingManyTMs, int numOfSenderTMs, ReconfDataDownstream reconfData) {
+        assert reconfData.numOfSenderTMsForDownstream == 0 || reconfData.numOfSenderTMsForDownstream == numOfSenderTMs;
+        reconfData.numOfSenderTMsForDownstream = numOfSenderTMs;
+        reconfData.multipleTMsInvolvedInReconfigurationDownstream = stateMigrationInvolvingManyTMs;
+    }
+
+    private void saveLastTupleData(
+            int senderId, ReconfigurableSourceData lastTupleData, int activeGroupID) {
+        ReconfDataSource reconfData = reconfDataPerActiveGroupSource.get(activeGroupID);
+        assert reconfData.lastTupleDataMap.get(senderId) == null;
+        reconfData.lastTupleDataMap.put(senderId, lastTupleData);
+
+        if (reconfData.lastTupleDataMap.size() == reconfData.totalNumOfSourcesActive &&
+                reconfData.sourceTasksOfPasiveQuery.size() == reconfData.totalNumOfSourcesPassive &&
+                reconfData.totalNumOfSourcesPassive > 0) {
+            sendLastTupleDataToJobMaster(activeGroupID);
+        }
+    }
+
+    private void saveSourceTask(int taskId, ExecutionAttemptID executionAttemptID, int activeGroupID) {
+        ReconfDataSource reconfData = reconfDataPerActiveGroupSource.get(activeGroupID);
+        reconfData.sourceTasksOfPasiveQuery.add(executionAttemptID);
+
+        if (reconfData.sourceTasksOfPasiveQuery.size() == reconfData.totalNumOfSourcesPassive) {
+            if (reconfData.lastTupleDataMap.size() == reconfData.totalNumOfSourcesActive
+                    && reconfData.totalNumOfSourcesActive > 0) {
+                sendLastTupleDataToJobMaster(activeGroupID);
+            } else if (reconfData.hostOfNewDriver != "") {
+                modifySourceConnection(activeGroupID);
+            }
+        }
+    }
+
+    private synchronized void sendLastTupleDataToJobMaster(int activeGroupID) {
+        ReconfDataSource reconfData = reconfDataPerActiveGroupSource.get(activeGroupID);
+        if (reconfData.numOfTMsWithSources > 1) {
+            if (jobTable.getJobs().size() == 1) {
+                log.debug(GROUP_SHARE, "Sending last tuple data to job master");
+
+                JobMasterGateway jobMasterGateway = getJobMasterGateway();
+                jobMasterGateway.sendLastTupleDataToJobMaster(
+                        reconfData.lastTupleDataMap, reconfData.numOfTMsWithSources,
+                        resourceIDOfThisTM, activeGroupID);
+            } else {
+                throw new RuntimeException(
+                        "More than one job found in the job table. We do not support"
+                                + " multiple jobs.");
+            }
+        } else {
+            sendLastTupleDataToSources(activeGroupID);
+        }
+    }
+
+    private void sendLastTupleDataToSources(int activeGroupId) {
+        log.debug(GROUP_SHARE, "Sending last tuple data to sources");
+        ReconfDataSource reconfData = reconfDataPerActiveGroupSource.get(activeGroupId);
+        for (ExecutionAttemptID entry : reconfData.sourceTasksOfPasiveQuery) {
+            final Task task = taskSlotTable.getTask(entry);
+            task.sendLastTupleData(reconfData.lastTupleDataMap);
+        }
+        reconfData.lastTupleDataMap.clear();
+        reconfData.sourceTasksOfPasiveQuery.clear();
+        reconfData.totalNumOfSourcesActive = 0;
+        reconfData.totalNumOfSourcesPassive = 0;
+        reconfData.numOfTMsWithSources = 0;
+        reconfDataPoolSource.add(reconfDataPerActiveGroupSource.remove(activeGroupId));
+    }
+
+    private synchronized void requestNewDriver(
+            String driverJobID, String hostname, String driverPort,
+            Set<ResourceID> taskManagerIDsPassiveQuery, int activeGroupID) {
+        log.debug(GROUP_SHARE, "Attempting to request a new driver " + driverJobID);
+        ReconfDataSource reconfData = reconfDataPerActiveGroupSource.get(activeGroupID);
+        assert !driverJobID.equals(""):
+                "task executor received empty driverJobId for new driver request";
+        assert reconfData.hostOfNewDriver.equals(""):
+                "hostOfNewDriver is not empty while attempting new driver request";
+        HttpClient client = HttpClient.newHttpClient();
+        HttpRequest request = HttpRequest.newBuilder()
+                .uri(URI.create("http://" + hostname + ":" + driverPort + "/jobs?toBeCopied=" + driverJobID
+                        + "&numCopies=1"))
+                .POST(HttpRequest.BodyPublishers.noBody())
+                .build();
+
+        try {
+            HttpResponse<String> response = client.send(request, HttpResponse.BodyHandlers.ofString());
+            log.debug(GROUP_SHARE, "Response to the new driver request: " + response.body());
+            // Parse the JSON response
+            JSONArray jsonArray = new JSONArray(response.body());
+            // Check that the array is not empty
+            if (jsonArray.length() > 0) {
+                // Get the first object from the array
+                JSONObject jsonObject = jsonArray.getJSONObject(0);
+
+                // Extract the jobId, hostname, and port
+                String newJobId = jsonObject.getString("jobId");
+                String newHostname = jsonObject.getString("hostname");
+                int newPort = jsonObject.getInt("port");
+
+                sendNewDriverInfoToJobMaster(newHostname, newPort, taskManagerIDsPassiveQuery, activeGroupID);
+
+            }
+        } catch (IOException e) {
+            throw new RuntimeException("Error with the copy driver request");
+        } catch (InterruptedException e) {
+            throw new RuntimeException("Error with the copy driver request");
+        }
+    }
+
+    private synchronized void sendNewDriverInfoToJobMaster(
+            String host, int port, Set<ResourceID> taskManagerIDsPassiveQuery, int activeGroupID) {
+        ReconfDataSource reconfData = reconfDataPerActiveGroupSource.get(activeGroupID);
+        if (reconfData.numOfTMsWithSources > 1) {
+            if (jobTable.getJobs().size() == 1) {
+                log.debug(GROUP_SHARE, "Sending new driver info to job master");
+
+                JobMasterGateway jobMasterGateway = getJobMasterGateway();
+                jobMasterGateway.sendNewDriverInfoAndResourceIDToJobMaster(
+                        host, port, taskManagerIDsPassiveQuery, activeGroupID);
+            } else {
+                throw new RuntimeException(
+                        "More than one job found in the job table. We do not support"
+                                + " multiple jobs.");
+            }
+        }
+        else {
+            // set newDriverHostAndPort
+            reconfData.hostOfNewDriver = host;
+            reconfData.portOfNewDriver = port;
+            if (reconfData.sourceTasksOfPasiveQuery.size() == reconfData.totalNumOfSourcesPassive
+                    && reconfData.totalNumOfSourcesPassive > 0) {
+                modifySourceConnection(activeGroupID);
+            }
+        }
+    }
+
+    private void modifySourceConnection(int activeGroupId) {
+        ReconfDataSource reconfData = reconfDataPerActiveGroupSource.get(activeGroupId);
+        for (ExecutionAttemptID entry : reconfData.sourceTasksOfPasiveQuery) {
+            final Task task = taskSlotTable.getTask(entry);
+            task.modifySourceConnection(reconfData.hostOfNewDriver, reconfData.portOfNewDriver);
+        }
+        reconfData.hostOfNewDriver = "";
+        reconfData.portOfNewDriver = 0;
+        reconfData.sourceTasksOfPasiveQuery.clear();
+        reconfData.totalNumOfSourcesPassive = 0;
+        reconfDataPoolSource.add(reconfDataPerActiveGroupSource.remove(activeGroupId));
+    }
+
+    private void increasePoolSize() {
+        for (int i = 0; i < 8; i++) {
+            reconfDataPool.add(new ReconfData());
+        }
+    }
+
+    private void increasePoolSizeDownstream() {
+        for (int i = 0; i < 8; i++) {
+            reconfDataPoolDownstream.add(new ReconfDataDownstream());
+        }
+    }
+
+    private void increasePoolSizeSource() {
+        for (int i = 0; i < 8; i++) {
+            reconfDataPoolSource.add(new ReconfDataSource());
+        }
+    }
+
+    private ReconfData getOrCreateReconfData(int activeGroupId) {
+        ReconfData reconfData;
+        if (reconfDataPerActiveGroup.containsKey(activeGroupId)) {
+            reconfData = reconfDataPerActiveGroup.get(activeGroupId);
+        } else {
+            if (reconfDataPool.size() == 0) {
+                increasePoolSize();
+            }
+            reconfData = reconfDataPool.remove(reconfDataPool.size() - 1);
+            reconfDataPerActiveGroup.put(activeGroupId, reconfData);
+        }
+        return reconfData;
+    }
+
+    private ReconfDataDownstream getOrCreateReconfDataDownstream(int activeGroupId) {
+        ReconfDataDownstream reconfData;
+        if (reconfDataPerActiveGroupDownstream.containsKey(activeGroupId)) {
+            reconfData = reconfDataPerActiveGroupDownstream.get(activeGroupId);
+        } else {
+            if (reconfDataPoolDownstream.size() == 0) {
+                increasePoolSizeDownstream();
+            }
+            reconfData = reconfDataPoolDownstream.remove(reconfDataPoolDownstream.size() - 1);
+            reconfDataPerActiveGroupDownstream.put(activeGroupId, reconfData);
+        }
+        return reconfData;
+    }
+
+    private ReconfDataSource getOrCreateReconfDataSource(int activeGroupId) {
+        ReconfDataSource reconfData;
+        if (reconfDataPerActiveGroupSource.containsKey(activeGroupId)) {
+            reconfData = reconfDataPerActiveGroupSource.get(activeGroupId);
+        } else {
+            if (reconfDataPoolSource.size() == 0) {
+                increasePoolSizeSource();
+            }
+            reconfData = reconfDataPoolSource.remove(reconfDataPoolSource.size() - 1);
+            reconfDataPerActiveGroupSource.put(activeGroupId, reconfData);
+        }
+        return reconfData;
     }
 
     @Override
@@ -1043,7 +1959,7 @@ public class TaskExecutor extends RpcEndpoint implements TaskExecutorGateway {
                             CheckpointFailureReason.UNKNOWN_TASK_CHECKPOINT_NOTIFICATION_FAILURE));
         }
     }
-    
+
 
     // ----------------------------------------------------------------------
     // Slot allocation RPCs
@@ -1282,6 +2198,119 @@ public class TaskExecutor extends RpcEndpoint implements TaskExecutorGateway {
                         .collect(Collectors.toList());
 
         return CompletableFuture.completedFuture(ThreadDumpInfo.create(threadInfos));
+    }
+
+    @Override
+    public void sendSerializedState(
+            Map<Integer, Map<Integer, Map<Integer, byte[]>>> state,
+            Map<Integer, Map<Integer, HashMap<byte[], byte[]>>> dedupMaps,
+            Map<Integer, List<byte[]>> triggers,
+            Map<Integer, Map<Integer, Map<Integer, byte[]>>> statePassiveQuery,
+            Map<Integer, String> stateNamesDict, int activeGroupId) {
+        ReconfData reconfData = reconfDataPerActiveGroup.get(activeGroupId);
+        log.debug(GROUP_SHARE, "Task Manager received serialized state: " + state
+                        + " activeGroupId: " + activeGroupId
+                        + "receivers " + reconfData.receivers.size() + " out of "
+                        + reconfData.totalNumOfReceivers);
+
+        if (reconfData != null && reconfData.receivers.size() == reconfData.totalNumOfReceivers
+                && reconfData.senders.size() == reconfData.totalNumOfSenders) {
+            sendSerializedStateToReceivers(reconfData, state, dedupMaps, triggers,
+                    statePassiveQuery, stateNamesDict, activeGroupId);
+        }
+        else {
+            PendingSerializedState pendingState = new PendingSerializedState(state, dedupMaps,
+                    triggers, statePassiveQuery, stateNamesDict);
+            pendingSerializedStatePerActiveGroup.put(activeGroupId, pendingState);
+        }
+    }
+
+    private void sendSerializedStateToReceivers(
+            ReconfData reconfData,
+            Map<Integer, Map<Integer, Map<Integer, byte[]>>> state,
+            Map<Integer, Map<Integer, HashMap<byte[], byte[]>>> dedupMaps,
+            Map<Integer, List<byte[]>> triggers,
+            Map<Integer, Map<Integer, Map<Integer, byte[]>>> statePassiveQuery,
+            Map<Integer, String> stateNamesDict, int activeGroupId) {
+        for (Map.Entry<Integer, ExecutionAttemptID> receiver : reconfData.receivers.entrySet()){
+            ExecutionAttemptID receiverExecAttempt = receiver.getValue();
+            final Task receiverTask = taskSlotTable.getTask(receiverExecAttempt);
+
+            Map<Integer, Map<Integer, byte[]>> stateForPartition = state != null ?
+                    state.get(receiver.getKey()) : null;
+            Map<Integer, HashMap<byte[], byte[]>> dedupMapsForPartition = dedupMaps != null ?
+                    dedupMaps.get(receiver.getKey()) : null;
+            List<byte[]> triggersForPartition = triggers != null ?
+                    triggers.get(receiver.getKey()) : null;
+            Map<Integer, Map<Integer, byte[]>> statePassiveQueryForPartition =
+                    statePassiveQuery != null ? statePassiveQuery.get(receiver.getKey()) : null;
+
+            receiverTask.sendSerializedStateToReceiver(
+                    stateForPartition,
+                    dedupMapsForPartition,
+                    triggersForPartition,
+                    statePassiveQueryForPartition,
+                    stateNamesDict);
+            log.debug(GROUP_SHARE, "Task Manager sent serialized state to receiver: " + receiver.getKey());
+        }
+        clearStateMigrationDataStructures(activeGroupId);
+        if (pendingSerializedStatePerActiveGroup.containsKey(activeGroupId)) {
+            pendingSerializedStatePerActiveGroup.remove(activeGroupId);
+        }
+    }
+
+    @Override
+    public void sendSerializedStateDownstream(
+            Map<Integer, Map<String, byte[][]>> state,
+            Map<Integer, HashMap<byte[], byte[]>[]> deduplicationMaps,
+            Map<Integer, byte[][]> triggers,
+            Map<Integer, Integer> queueSizes, int activeGroupId) {
+        log.debug(GROUP_SHARE, "Task Manager received serialized state for downstream");
+        ReconfDataDownstream reconfData = reconfDataPerActiveGroupDownstream.get(activeGroupId);
+
+        for (Map.Entry<Integer, ExecutionAttemptID> receiver : reconfData.downstreamReceivers.entrySet()){
+            ExecutionAttemptID receiverExecAttempt = receiver.getValue();
+            final Task receiverTask = taskSlotTable.getTask(receiverExecAttempt);
+
+            Map<String, byte[][]> stateForPartition = state != null ?
+                    state.get(receiver.getKey()) : null;
+            HashMap<byte[], byte[]>[] dedupMapsForPartition = deduplicationMaps != null ?
+                    deduplicationMaps.get(receiver.getKey()) : null;
+            byte[][] triggersForPartition = triggers != null ?
+                    triggers.get(receiver.getKey()) : null;
+            int queueSize = queueSizes != null ? queueSizes.get(receiver.getKey()) : 0;
+
+            receiverTask.sendSerializedStateToReceiverDownstream(
+                    stateForPartition,
+                    dedupMapsForPartition,
+                    triggersForPartition,
+                    queueSize);
+        }
+        clearStateMigrationDataStructuresDownstream(activeGroupId);
+    }
+
+    @Override
+    public void sendLastTupleData(Map<Integer, ReconfigurableSourceData> lastTupleData, int activeGroupId) {
+        log.debug(GROUP_SHARE, "Task Manager received last tuple data: " + lastTupleData);
+
+        ReconfDataSource reconfData = reconfDataPerActiveGroupSource.get(activeGroupId);
+
+        reconfData.lastTupleDataMap = lastTupleData;
+        sendLastTupleDataToSources(activeGroupId);
+    }
+
+    @Override
+    public void sendNewDriverInfo(String host, int port, int activeGroupId) {
+        log.debug(GROUP_SHARE, "Task Manager received new driver info: " + host + ":" + port);
+
+        ReconfDataSource reconfData = reconfDataPerActiveGroupSource.get(activeGroupId);
+
+        reconfData.hostOfNewDriver = host;
+        reconfData.portOfNewDriver = port;
+        if (reconfData.sourceTasksOfPasiveQuery.size() == reconfData.totalNumOfSourcesPassive
+                && reconfData.totalNumOfSourcesPassive > 0) {
+            modifySourceConnection(activeGroupId);
+        }
     }
 
     // ------------------------------------------------------------------------
@@ -2329,6 +3358,220 @@ public class TaskExecutor extends RpcEndpoint implements TaskExecutorGateway {
                 TaskExecutor.this.updateTaskExecutionState(jobMasterGateway, taskExecutionState);
             }
         }
+
+        @Override
+        public void sendState(int senderId, Map<Integer, Map<String, Map<Integer, StateMap<?, ?, ?>>>> state,
+                              Map<ResourceID, Map<Integer, Map<Integer, Map<Integer, byte[]>>>> stateForOtherTMs,
+                              int numOfSenders, int numOfReceivers, Map<Integer, String> stateNames,
+                              boolean stateMigrationInvolvingMultipleTMs, int numOfSenderTMs,
+                              int activeGroupId) {
+            log.debug(GROUP_SHARE, "State migration: The task manager received state " + senderId
+                    + " active-id " + activeGroupId);
+            runAsync(
+                    () ->
+                    {
+                        ReconfData reconfData = getOrCreateReconfData(activeGroupId);
+                        TaskExecutor.this.reconfDataPerActiveGroup.get(activeGroupId);
+                        TaskExecutor.this.setNumOfSenders(numOfSenders, reconfData);
+                        TaskExecutor.this.setNumOfReceivers(numOfReceivers, reconfData);
+                        TaskExecutor.this.saveStateToBeMigrated(state, reconfData);
+                        TaskExecutor.this.saveStateForOtherTMsToBeMigrated(stateForOtherTMs, stateNames, reconfData);
+                        TaskExecutor.this.setConfigForMultiTMs(stateMigrationInvolvingMultipleTMs, numOfSenderTMs, reconfData);
+                        // I could also just have a counter for the senders that have reached out
+                        //  however, I keep the list to make sure I never communicate
+                        //  with the same sender again before sending the state
+                        //  (could happen if a controlMessage is sent before the previous is completed)
+                        TaskExecutor.this.saveSender(senderId, reconfData);
+                        TaskExecutor.this.tryToSendState(activeGroupId);
+                    });
+        }
+
+        @Override
+        public void sendState(
+                int senderId, Map<Integer, Map<String, Map<Integer, StateMap<?, ?, ?>>>> state,
+                Map<ResourceID, Map<Integer, Map<Integer, Map<Integer, byte[]>>>> stateForOtherTMs,
+                Map<Integer, Map<Integer, HashMap<?, ?>>> deduplicationMaps,
+                Map<Integer, List<HeapPriorityQueueElement>> triggers,
+                Map<ResourceID, Map<Integer, Map<Integer, HashMap<byte[], byte[]>>>> deduplicationMapsForOtherTMs,
+                Map<ResourceID, Map<Integer, List<byte[]>>> triggersForOtherTMs,
+                int numOfSenders, int numOfReceivers, Map<Integer, String> stateNames,
+                boolean stateMigrationInvolvingMultipleTMs, int numOfSenderTMs,
+                int activeGroupId) {
+            log.debug(GROUP_SHARE, "State migration: The task manager received windowed state "
+                    + senderId + " active-id " + activeGroupId);
+            runAsync(
+                    () ->
+                    {
+                        ReconfData reconfData = getOrCreateReconfData(activeGroupId);
+                        TaskExecutor.this.setNumOfSenders(numOfSenders, reconfData);
+                        TaskExecutor.this.setNumOfReceivers(numOfReceivers, reconfData);
+                        TaskExecutor.this.saveStateToBeMigrated(state, reconfData);
+                        TaskExecutor.this.saveWindowStateToBeMigrated(deduplicationMaps, triggers, reconfData);
+                        TaskExecutor.this.saveStateForOtherTMsToBeMigrated(stateForOtherTMs, stateNames, reconfData);
+                        TaskExecutor.this.saveWindowStateForOtherTMsToBeMigrated(
+                                deduplicationMapsForOtherTMs, triggersForOtherTMs, reconfData);
+                        TaskExecutor.this.setConfigForMultiTMs(stateMigrationInvolvingMultipleTMs,
+                                numOfSenderTMs, reconfData);
+                        TaskExecutor.this.saveSender(senderId, reconfData);
+                        TaskExecutor.this.tryToSendState(activeGroupId);
+                    });
+        }
+
+        @Override
+        public void sendStatePassiveQuery(
+                int senderId,
+                Map<Integer, Map<String, Map<Integer, StateMap<?, ?, ?>>>> state,
+                Map<ResourceID, Map<Integer, Map<Integer, Map<Integer, byte[]>>>> stateForOtherTMs,
+                Map<Integer, String> stateNames,
+                int numOfSenders, int numOfReceivers, int activeGroupId) {
+            log.debug(GROUP_SHARE, "State migration: The task manager received state from passive query "
+                    + senderId + " active-id " + activeGroupId);
+            runAsync(
+                    () ->
+                    {
+                        ReconfData reconfData = getOrCreateReconfData(activeGroupId);
+                        TaskExecutor.this.setNumOfSenders(numOfSenders, reconfData);
+                        TaskExecutor.this.setNumOfReceivers(numOfReceivers, reconfData);
+                        TaskExecutor.this.saveStateToBeMigratedPassiveQuery(state, reconfData);
+                        TaskExecutor.this.saveStateForOtherTMsToBeMigratedPassive(stateForOtherTMs, stateNames, reconfData);
+                        TaskExecutor.this.saveSender(senderId + OFFSET_FOR_SENDER_ID_PASSIVE_QUERY, reconfData);
+                        TaskExecutor.this.tryToSendState(activeGroupId);
+                    });
+        }
+
+        @Override
+        public void sendReceiverExecutionAttemptID(
+                int receiverId, ExecutionAttemptID executionAttemptID, int numOfSenders,
+                int numOfReceivers, boolean stateMigrationInvolvingMultipleTMs, int numOfSenderTMs,
+                int activeGroupId) {
+            log.debug(GROUP_SHARE, "Task manager received the execution attempt id of a receiver "
+                    + receiverId + " active-id " + activeGroupId);
+            runAsync(
+                    () ->
+                    {
+                        ReconfData reconfData = getOrCreateReconfData(activeGroupId);
+                        TaskExecutor.this.setNumOfSenders(numOfSenders, reconfData);
+                        TaskExecutor.this.setNumOfReceivers(numOfReceivers, reconfData);
+                        TaskExecutor.this.setConfigForMultiTMs(stateMigrationInvolvingMultipleTMs,
+                                numOfSenderTMs, reconfData);
+                        TaskExecutor.this.saveReceiver(receiverId, executionAttemptID, reconfData);
+                        TaskExecutor.this.tryToSendState(activeGroupId);
+                    });
+        }
+
+        @Override
+        public void sendStateOfDownstream(int senderId, Map<String, StateMap<?, ?, ?>[]> state,
+                                          Map<String, byte[][]> serializedState,
+                                          int numOfSenders, ResourceID receiverTMId,
+                                          boolean multipleTMsInvolvedInMigrationDownstream,
+                                          int numOfSenderTMs, int activeGroupId) {
+            log.debug(GROUP_SHARE, "State migration: The task manager received state of downstream "
+                    + senderId + " active-id " + activeGroupId);
+            runAsync(
+                    () ->
+                    {
+                        ReconfDataDownstream reconfData = getOrCreateReconfDataDownstream(activeGroupId);
+                        TaskExecutor.this.setNumOfDownstreamSenders(numOfSenders, reconfData);
+                        TaskExecutor.this.saveStateToBeMigratedDownstream(senderId, state, reconfData);
+                        TaskExecutor.this.setConfigForMultiTMsDownstream(multipleTMsInvolvedInMigrationDownstream, numOfSenderTMs, reconfData);
+                        if (serializedState != null) {
+                            TaskExecutor.this.saveStateToBeMigratedDownstreamForOtherTMs(
+                                    senderId, serializedState, receiverTMId, reconfData);
+                        }
+                        TaskExecutor.this.tryToSendStateDownstream(activeGroupId);
+                    });
+        }
+
+        @Override
+        public void sendStateOfDownstream(int senderId, Map<String, StateMap<?, ?, ?>[]> state,
+                                          Map<String, byte[][]> serializedState,
+                                          HashMap<?, ?>[] deduplicationMaps,
+                                          HashMap<byte[], byte[]>[] dedupMapsForOtherTMs,
+                                          HeapPriorityQueueElement[] triggers,
+                                          byte[][] triggersForOtherTMs, int queueSize,
+                                          int numOfSenders, ResourceID receiverTMId,
+                                          boolean multipleTMsInvolvedInMigration,
+                                          int numOfSenderTMs, int activeGroupId) {
+            log.debug(GROUP_SHARE, "State migration: The task manager received state of downstream "
+                    + senderId + " active-id " + activeGroupId);
+            runAsync(
+                    () ->
+                    {
+                        ReconfDataDownstream reconfData = getOrCreateReconfDataDownstream(activeGroupId);
+                        TaskExecutor.this.setNumOfDownstreamSenders(numOfSenders, reconfData);
+                        TaskExecutor.this.saveStateToBeMigratedDownstream(senderId, state, reconfData);
+                        TaskExecutor.this.saveWindowStateToBeMigratedDownstream(
+                                senderId, deduplicationMaps, triggers, queueSize, reconfData);
+                        TaskExecutor.this.setConfigForMultiTMsDownstream(multipleTMsInvolvedInMigration, numOfSenderTMs, reconfData);
+                        if (serializedState != null) {
+                            TaskExecutor.this.saveStateToBeMigratedDownstreamForOtherTMs(
+                                    senderId, serializedState, receiverTMId, reconfData);
+                            TaskExecutor.this.saveWindowStateToBeMigratedDownstreamForOtherTMs(
+                                    senderId, dedupMapsForOtherTMs, triggersForOtherTMs, queueSize, receiverTMId, reconfData);
+                        }
+                        TaskExecutor.this.tryToSendStateDownstream(activeGroupId);
+                    });
+        }
+
+        @Override
+        public void sendDownstreamReceiverExecutionAttemptID(int receiverId, ExecutionAttemptID executionAttemptID,
+                                                   int numOfReceivers, int activeGroupId) {
+            log.debug(GROUP_SHARE, "Task manager received the execution attempt id of a downstream receiver "
+                    + receiverId + " active-id " + activeGroupId);
+            runAsync(
+                    () ->
+                    {
+                        ReconfDataDownstream reconfData = getOrCreateReconfDataDownstream(activeGroupId);
+                        TaskExecutor.this.setNumOfDownstreamReceivers(numOfReceivers, reconfData);
+                        TaskExecutor.this.saveDownstreamReceiver(receiverId, executionAttemptID, reconfData);
+                        TaskExecutor.this.tryToSendStateDownstream(activeGroupId);
+                    });
+        }
+
+        @Override
+        public void sendLastTupleData(int senderId, ReconfigurableSourceData tupleData,
+                                      int numOfSources, int numOfTMs, int activeGroupId) {
+            log.debug(GROUP_SHARE, "Task manager received info about the last tuple before reconfiguration from "
+                    + senderId + " active-id " + activeGroupId);
+            runAsync(
+                    () ->
+                    {
+                        ReconfDataSource reconfData = getOrCreateReconfDataSource(activeGroupId);
+                        TaskExecutor.this.setNumOfSourcesActive(numOfSources, reconfData);
+                        TaskExecutor.this.setNumOfTMsSources(numOfTMs, reconfData);
+                        TaskExecutor.this.saveLastTupleData(senderId, tupleData, activeGroupId);
+                    });
+        }
+
+        @Override
+        public void sendSourceTaskExecutionAttemptID(int taskId, ExecutionAttemptID executionAttemptID,
+                                                     int numOfSources, int numOfTMs,
+                                                     ResourceID taskManagerId, int activeGroupId) {
+            log.debug(GROUP_SHARE, "Task manager received the execution attempt id of a source task "
+                    + taskId + " active-id " + activeGroupId);
+            runAsync(
+                    () ->
+                    {
+                        ReconfDataSource reconfData = getOrCreateReconfDataSource(activeGroupId);
+                        TaskExecutor.this.setNumOfSourcesPassive(numOfSources, reconfData);
+                        TaskExecutor.this.setNumOfTMsSources(numOfTMs, reconfData);
+                        TaskExecutor.this.setResourceId(taskManagerId);
+                        TaskExecutor.this.saveSourceTask(taskId, executionAttemptID, activeGroupId);
+                    });
+        }
+
+        @Override
+        public void sendDriverJobIDAndHostname(
+                String driverJobID, String hostname, String driverPort,
+                Set<ResourceID> taskManagerIDsPassiveQuery, int activeGroupId) {
+            log.debug(GROUP_SHARE, "Task manager received the driver job id" + " active-id " + activeGroupId);
+            runAsync(
+                    () ->
+                    {
+                        TaskExecutor.this.requestNewDriver(
+                                driverJobID, hostname, driverPort, taskManagerIDsPassiveQuery, activeGroupId);
+                    });
+        }
     }
 
     private class SlotActionsImpl implements SlotActions {
@@ -2482,6 +3725,16 @@ public class TaskExecutor extends RpcEndpoint implements TaskExecutorGateway {
         static TaskExecutorJobServices create(
                 LibraryCacheManager.ClassLoaderLease classLoaderLease, Runnable closeHook) {
             return new TaskExecutorJobServices(classLoaderLease, closeHook);
+        }
+    }
+
+    private class TriggersOfDownstream {
+        public HeapPriorityQueueElement[] triggers;
+        public int queueSize;
+
+        public TriggersOfDownstream(HeapPriorityQueueElement[] triggers, int queueSize) {
+            this.triggers = triggers;
+            this.queueSize = queueSize;
         }
     }
 }

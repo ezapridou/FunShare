@@ -35,11 +35,11 @@ public class KeyGroupRange implements KeyGroupsList, Serializable {
     /** The empty key-group */
     public static final KeyGroupRange EMPTY_KEY_GROUP_RANGE = new KeyGroupRange();
 
-    private final int startKeyGroup;
-    private final int endKeyGroup;
+    protected final int startKeyGroup;
+    protected final int endKeyGroup;
 
     /** Empty KeyGroup Constructor */
-    private KeyGroupRange() {
+    protected KeyGroupRange() {
         this.startKeyGroup = 0;
         this.endKeyGroup = -1;
     }
@@ -55,7 +55,7 @@ public class KeyGroupRange implements KeyGroupsList, Serializable {
         Preconditions.checkArgument(startKeyGroup <= endKeyGroup);
         this.startKeyGroup = startKeyGroup;
         this.endKeyGroup = endKeyGroup;
-        Preconditions.checkArgument(getNumberOfKeyGroups() >= 0, "Potential overflow detected.");
+        // Preconditions.checkArgument(getNumberOfKeyGroups() >= 0, "Potential overflow detected.");
     }
 
     /**
@@ -95,6 +95,10 @@ public class KeyGroupRange implements KeyGroupsList, Serializable {
     /** @return The last key-group in the range. */
     public int getEndKeyGroup() {
         return endKeyGroup;
+    }
+
+    public int getDop() {
+        throw new UnsupportedOperationException("Not supported.");
     }
 
     @Override
@@ -174,8 +178,6 @@ public class KeyGroupRange implements KeyGroupsList, Serializable {
      * @return the key-group from start to end or an empty key-group range.
      */
     public static KeyGroupRange of(int startKeyGroup, int endKeyGroup) {
-        return startKeyGroup <= endKeyGroup
-                ? new KeyGroupRange(startKeyGroup, endKeyGroup)
-                : EMPTY_KEY_GROUP_RANGE;
+        throw new UnsupportedOperationException("Not implemented yet.");
     }
 }

@@ -18,22 +18,35 @@
 
 package org.apache.flink.runtime.jobgraph.tasks;
 
-import org.apache.flink.runtime.controller.ControlMessage;
+import net.michaelkoepf.spegauge.api.sut.DataDistrSplitStats;
+import net.michaelkoepf.spegauge.api.sut.FilterDataDistrMergeStats;
+import net.michaelkoepf.spegauge.api.sut.JoinDataDistrMergeStats;
+import net.michaelkoepf.spegauge.api.sut.ReconfigurableSourceData;
+
+import org.apache.flink.extensions.controller.ControlMessage;
 
 import org.apache.flink.api.common.ExecutionConfig;
 import org.apache.flink.configuration.Configuration;
+import org.apache.flink.extensions.controller.StopMonitoringDataDistrControlMessage;
 import org.apache.flink.runtime.checkpoint.CheckpointException;
 import org.apache.flink.runtime.checkpoint.CheckpointMetaData;
 import org.apache.flink.runtime.checkpoint.CheckpointMetricsBuilder;
 import org.apache.flink.runtime.checkpoint.CheckpointOptions;
+import org.apache.flink.extensions.controller.TaskUtilizationStats;
 import org.apache.flink.runtime.execution.Environment;
 import org.apache.flink.runtime.io.network.partition.consumer.InputGate;
 import org.apache.flink.runtime.jobgraph.OperatorID;
 import org.apache.flink.runtime.operators.coordination.OperatorEvent;
+import org.apache.flink.runtime.state.heap.HeapPriorityQueueElement;
+import org.apache.flink.runtime.state.heap.StateMap;
+import org.apache.flink.runtime.taskmanager.TaskManagerActions;
 import org.apache.flink.util.FlinkException;
 import org.apache.flink.util.SerializedValue;
 
 import java.io.IOException;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.Future;
 
@@ -117,7 +130,81 @@ public abstract class AbstractInvokable {
 
     public void sendControl(ControlMessage controlMessage) {
         //do nothing
-        return;
+    }
+
+    public FilterDataDistrMergeStats sendStopDataDistrControlFilter(StopMonitoringDataDistrControlMessage controlMessage){
+        //do nothing
+        return null;
+    }
+
+    public JoinDataDistrMergeStats sendStopDataDistrControlJoin(StopMonitoringDataDistrControlMessage controlMessage){
+        //do nothing
+        return null;
+    }
+
+    public TaskUtilizationStats sendMonitoringMsg() {
+        //do nothing
+        return null;
+    }
+
+    public double sendThroughputMonitoringMsg() {
+        //do nothing
+        return 0;
+    }
+
+    public DataDistrSplitStats sendSplitPhaseMonitoringMsg() {
+        //do nothing
+        return null;
+    }
+
+    public FilterDataDistrMergeStats sendEndDataDistrMonitoringMsgFilter() {
+        //do nothing
+        return null;
+    }
+
+    public JoinDataDistrMergeStats sendEndDataDistrMonitoringMsgJoin() {
+        //do nothing
+        return null;
+    }
+
+    public void sendStateToReceiver(
+            Map<String, Map<Integer, StateMap<?, ?, ?>>> state,
+            Map<String, Map<Integer, StateMap<?, ?, ?>>> statePassiveQuery,
+            Map<Integer, HashMap<?, ?>> dedupMaps,
+            List<HeapPriorityQueueElement> triggers) {
+        // do nothing
+    }
+
+    public void sendStateToReceiverDownstream(Map<String, StateMap<?, ?, ?>[]> state,
+                                              HashMap<?, ?>[] deduplicationMaps,
+                                              HeapPriorityQueueElement[] triggers, int queueSize) {
+        // do nothing
+    }
+
+    public void sendSerializedStateToReceiver(Map<Integer, Map<Integer, byte[]>> state,
+                                              Map<Integer, HashMap<byte[], byte[]>> dedupMaps,
+                                              List<byte[]> triggers,
+                                              Map<Integer, Map<Integer, byte[]>> statePassiveQuery,
+                                              Map<Integer, String> stateNameDict) {
+        // do nothing
+    }
+
+    public void sendSerializedStateToReceiverDownstream(Map<String, byte[][]> state,
+                                                        HashMap<byte[], byte[]>[] dedupMaps,
+                                                        byte[][] triggers, int queueSize) {
+        // do nothing
+    }
+
+    public void setTaskManagerActions(TaskManagerActions taskManagerActions) {
+        // do nothing
+    }
+
+    public void sendLastTupleData(Map<Integer, ReconfigurableSourceData> lastTupleDataMap) {
+        // do nothing
+    }
+
+    public void modifySourceConnection(String host, int port) {
+        // do nothing
     }
 
     public void pause() {

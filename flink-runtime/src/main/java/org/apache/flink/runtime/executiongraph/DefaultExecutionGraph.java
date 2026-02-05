@@ -50,7 +50,7 @@ import org.apache.flink.runtime.concurrent.ComponentMainThreadExecutor;
 import org.apache.flink.runtime.concurrent.FutureUtils;
 import org.apache.flink.runtime.concurrent.FutureUtils.ConjunctFuture;
 import org.apache.flink.runtime.concurrent.ScheduledExecutorServiceAdapter;
-import org.apache.flink.runtime.controller.Controller;
+import org.apache.flink.extensions.controller.Controller;
 import org.apache.flink.runtime.deployment.TaskDeploymentDescriptorFactory;
 import org.apache.flink.runtime.entrypoint.ClusterEntryPointExceptionUtils;
 import org.apache.flink.runtime.execution.ExecutionState;
@@ -265,6 +265,8 @@ public class DefaultExecutionGraph implements ExecutionGraph, InternalExecutionG
     private final Map<IntermediateResultPartitionID, IntermediateResultPartition>
             resultPartitionsById;
 
+    private final Controller controller;
+
     // --------------------------------------------------------------------------------------------
     //   Constructors
     // --------------------------------------------------------------------------------------------
@@ -347,7 +349,7 @@ public class DefaultExecutionGraph implements ExecutionGraph, InternalExecutionG
         this.edgeManager = new EdgeManager();
         this.executionVerticesById = new HashMap<>();
         this.resultPartitionsById = new HashMap<>();
-        Controller.registerJobToSendControl(this);
+        this.controller = new Controller();
     }
 
     @Override
@@ -826,6 +828,8 @@ public class DefaultExecutionGraph implements ExecutionGraph, InternalExecutionG
 
         partitionReleaseStrategy =
                 partitionReleaseStrategyFactory.createInstance(getSchedulingTopology());
+
+        controller.registerJobToSendControl(this, getJobID());
     }
 
     @Override

@@ -17,8 +17,15 @@
 
 package org.apache.flink.streaming.api.functions.source;
 
+import net.michaelkoepf.spegauge.api.sut.ReconfigurableSourceData;
+
 import org.apache.flink.annotation.Public;
 import org.apache.flink.api.common.functions.AbstractRichFunction;
+import net.michaelkoepf.spegauge.api.sut.ReconfigurableSource;
+
+import org.apache.flink.streaming.runtime.tasks.StreamTask;
+
+import java.util.Map;
 
 /**
  * Base class for implementing a parallel data source. Upon execution, the runtime will execute as
@@ -36,4 +43,45 @@ public abstract class RichParallelSourceFunction<OUT> extends AbstractRichFuncti
         implements ParallelSourceFunction<OUT> {
 
     private static final long serialVersionUID = 1L;
+
+    public void requestDisconnectionFromDriver(Map<Integer, ReconfigurableSourceData> lastTupleData) {
+        if (this instanceof ReconfigurableSource) {
+            ((ReconfigurableSource)this).requestDisconnectionFromDriver(lastTupleData);
+        }
+        else {
+            throw new UnsupportedOperationException("This source is an object of class " +
+                    this.getClass().getName() + " and does not support reconfiguration");
+        }
+
+    }
+
+    public ReconfigurableSourceData getData() {
+        if (this instanceof ReconfigurableSource) {
+            return ((ReconfigurableSource)this).getData();
+        }
+        else {
+            throw new UnsupportedOperationException("This source is an object of class " +
+                    this.getClass().getName() + " and does not support reconfiguration");
+        }
+    }
+
+    public void modifySourceConnection(String host, int port) {
+        if (this instanceof ReconfigurableSource) {
+            ((ReconfigurableSource)this).modifyConnectionData(host, port);
+        }
+        else {
+            throw new UnsupportedOperationException("This source is an object of class " +
+                    this.getClass().getName() + " and does not support reconfiguration");
+        }
+    }
+
+    public void setStreamTaskPointer(StreamTask task) {
+        if (this instanceof ReconfigurableSource) {
+            ((ReconfigurableSource)this).setStreamTaskPointer(task);
+        }
+        else {
+            throw new UnsupportedOperationException("This source is an object of class " +
+                    this.getClass().getName() + " and does not support reconfiguration");
+        }
+    }
 }

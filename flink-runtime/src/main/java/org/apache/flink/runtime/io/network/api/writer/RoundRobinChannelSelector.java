@@ -49,4 +49,9 @@ public class RoundRobinChannelSelector<T extends IOReadableWritable> implements 
     public boolean isBroadcast() {
         return false;
     }
+
+    @Override
+    public void setNumberOfChannels(int numberOfChannels) {
+        throw new UnsupportedOperationException("RoundRobinChannelSelector does not support setNumberOfChannels");
+    }
 }

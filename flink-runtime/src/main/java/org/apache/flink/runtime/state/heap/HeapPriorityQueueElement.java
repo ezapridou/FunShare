@@ -47,4 +47,6 @@ public interface HeapPriorityQueueElement {
      * @param newIndex the new index in the timer heap.
      */
     void setInternalIndex(int newIndex);
+
+    String toStringCustom();
 }

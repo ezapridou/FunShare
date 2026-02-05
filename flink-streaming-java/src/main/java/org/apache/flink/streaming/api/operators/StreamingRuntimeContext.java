@@ -38,10 +38,13 @@ import org.apache.flink.api.common.state.StateDescriptor;
 import org.apache.flink.api.common.state.ValueState;
 import org.apache.flink.api.common.state.ValueStateDescriptor;
 import org.apache.flink.metrics.MetricGroup;
+import org.apache.flink.runtime.clusterframework.types.ResourceID;
 import org.apache.flink.runtime.execution.Environment;
 import org.apache.flink.runtime.externalresource.ExternalResourceInfoProvider;
 import org.apache.flink.runtime.jobgraph.OperatorID;
 import org.apache.flink.runtime.jobgraph.tasks.InputSplitProvider;
+import org.apache.flink.runtime.state.DefaultKeyedStateStore;
+import org.apache.flink.runtime.state.heap.StateMap;
 import org.apache.flink.runtime.taskexecutor.GlobalAggregateManager;
 import org.apache.flink.runtime.taskmanager.TaskManagerRuntimeInfo;
 import org.apache.flink.streaming.api.CheckpointingMode;
@@ -259,5 +262,121 @@ public class StreamingRuntimeContext extends AbstractRuntimeUDFContext {
      */
     public CheckpointingMode getCheckpointMode() {
         return streamConfig.getCheckpointMode();
+    }
+
+    /**
+     * This method is used for debugging purposes.
+     * @param taskName
+     */
+    public void printState(String taskName) {
+        if (keyedStateStore instanceof DefaultKeyedStateStore){
+            ((DefaultKeyedStateStore) keyedStateStore).printState(taskName);
+        }
+        else{
+            throw new UnsupportedOperationException("The keyedStateStore is not DefaultKeyedStateStore");
+        }
+    }
+
+    public Map<String, StateMap<?, ?, ?>[]> getEntriesForMigrationDownstream(
+            boolean stateMustBeSerialized,
+            Map<String, byte[][]> stateForOtherTM) {
+        if (keyedStateStore instanceof DefaultKeyedStateStore){
+            return ((DefaultKeyedStateStore)keyedStateStore).getEntriesForMigrationDownstream(
+                    stateMustBeSerialized, stateForOtherTM);
+        }
+        else{
+            throw new UnsupportedOperationException("The keyedStateStore is not DefaultKeyedStateStore");
+        }
+    }
+
+    public Map<Integer, Map<String, Map<Integer, StateMap<?, ?, ?>>>> getEntriesForMigration(
+            int newDOP, int taskIndex, int maxParallelism,
+            Map<Integer, ResourceID> partitionToResourceIDMap,
+            Map<ResourceID, Map<Integer, Map<Integer, Map<Integer, byte[]>>>> stateForOtherTMs,
+            Map<Integer, String> stateNameDict, List<Integer> partitionIdToTaskId){
+        if (keyedStateStore instanceof DefaultKeyedStateStore){
+            return ((DefaultKeyedStateStore)keyedStateStore).getEntriesForMigration(
+                    newDOP, taskIndex, maxParallelism, partitionToResourceIDMap, stateForOtherTMs,
+                    stateNameDict, partitionIdToTaskId);
+        }
+        else{
+            throw new UnsupportedOperationException("The keyedStateStore is not DefaultKeyedStateStore");
+        }
+    }
+
+    public Map<Integer, Map<String, Map<Integer, StateMap<?, ?, ?>>>> getEntireStateForMigration(
+            int newDOP, int taskIndex, int maxParallelism,
+            Map<Integer, ResourceID> partitionToResourceIDMapActive,
+            Map<Integer, ResourceID> partitionToResourceIDMapPassive,
+            Map<ResourceID, Map<Integer, Map<Integer, Map<Integer, byte[]>>>> stateForOtherTMs,
+            Map<Integer, String> stateNameDict, List<Integer> partitionIdToTaskId){
+        if (keyedStateStore instanceof DefaultKeyedStateStore){
+            return ((DefaultKeyedStateStore)keyedStateStore).getEntireStateForMigration(
+                    newDOP, taskIndex, maxParallelism, partitionToResourceIDMapActive,
+                    partitionToResourceIDMapPassive, stateForOtherTMs, stateNameDict, partitionIdToTaskId);
+        }
+        else{
+            throw new UnsupportedOperationException("The keyedStateStore is not DefaultKeyedStateStore");
+        }
+    }
+
+    public Map<Integer, Map<String, Map<Integer, StateMap<?, ?, ?>>>> getEntriesInRangeForMigration(
+            int newDOP, int taskIndex, int maxParallelism, long start, long end, long start2, long end2,
+            Map<Integer, ResourceID> partitionToResourceIDMapActive,
+            Map<Integer, ResourceID> partitionToResourceIDMapPassive,
+            Map<ResourceID, Map<Integer, Map<Integer, Map<Integer, byte[]>>>> stateForOtherTMs,
+            Map<Integer, String> stateNameDict, List<Integer> partitionIdToTaskId) {
+        if (keyedStateStore instanceof DefaultKeyedStateStore){
+            return ((DefaultKeyedStateStore)keyedStateStore).getEntriesInRangeForMigration(
+                    newDOP, taskIndex, maxParallelism, start, end, start2, end2,
+                    partitionToResourceIDMapActive, partitionToResourceIDMapPassive, stateForOtherTMs,
+                    stateNameDict, partitionIdToTaskId);
+        }
+        else{
+            throw new UnsupportedOperationException("The keyedStateStore is not DefaultKeyedStateStore");
+        }
+    }
+
+    public void incorporateReceivedState(Map<String, Map<Integer, StateMap<?, ?, ?>>> newStateMaps,
+                                         Map<String, Map<Integer, StateMap<?, ?, ?>>> newStateMapsPassiveQuery,
+                                         int newDOP, int operatorIndex) {
+        if (keyedStateStore instanceof DefaultKeyedStateStore){
+            ((DefaultKeyedStateStore)keyedStateStore).incorporateReceivedState(
+                    newStateMaps, newStateMapsPassiveQuery, newDOP, operatorIndex);
+        }
+        else{
+            throw new UnsupportedOperationException("The keyedStateStore is not DefaultKeyedStateStore");
+        }
+    }
+
+    public void incorporateReceivedState(Map<String, StateMap<?, ?, ?>[]> newStateMaps) {
+        if (keyedStateStore instanceof DefaultKeyedStateStore){
+            ((DefaultKeyedStateStore)keyedStateStore).incorporateReceivedState(newStateMaps);
+        }
+        else{
+            throw new UnsupportedOperationException("The keyedStateStore is not DefaultKeyedStateStore");
+        }
+    }
+
+    public void incorporateReceivedSerializedState(
+            Map<Integer, Map<Integer, byte[]>> newState,
+            Map<Integer, Map<Integer, byte[]>> statePassiveQuery,
+            Map<Integer, String> stateNameDict) {
+        if (keyedStateStore instanceof DefaultKeyedStateStore){
+            ((DefaultKeyedStateStore)keyedStateStore).incorporateReceivedSerializedState(
+                    newState, statePassiveQuery, stateNameDict);
+        }
+        else{
+            throw new UnsupportedOperationException("The keyedStateStore is not DefaultKeyedStateStore");
+        }
+    }
+
+    public void incorporateReceivedSerializedStateDownstream(Map<String, byte[][]> newState) {
+        if (keyedStateStore instanceof DefaultKeyedStateStore){
+            ((DefaultKeyedStateStore)keyedStateStore).incorporateReceivedSerializedStateDownstream(newState);
+        }
+        else{
+            throw new UnsupportedOperationException("The keyedStateStore is not DefaultKeyedStateStore");
+        }
     }
 }

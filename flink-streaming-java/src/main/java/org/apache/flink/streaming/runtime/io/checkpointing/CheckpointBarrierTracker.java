@@ -18,11 +18,9 @@
 
 package org.apache.flink.streaming.runtime.io.checkpointing;
 
-import org.apache.flink.runtime.controller.ControlMessage;
+import org.apache.flink.extensions.controller.ControlMessage;
 
 import org.apache.flink.annotation.Internal;
-import org.apache.flink.runtime.checkpoint.CheckpointException;
-import org.apache.flink.runtime.checkpoint.CheckpointFailureReason;
 import org.apache.flink.runtime.checkpoint.channel.InputChannelInfo;
 import org.apache.flink.runtime.io.network.api.CancelCheckpointMarker;
 import org.apache.flink.runtime.io.network.api.CheckpointBarrier;
@@ -34,9 +32,6 @@ import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
 import java.util.ArrayDeque;
-import java.util.HashMap;
-import java.util.HashSet;
-import java.util.concurrent.atomic.AtomicInteger;
 
 /**
  * The {@link CheckpointBarrierTracker} keeps track of what checkpoint barriers have been received
@@ -154,7 +149,7 @@ public class CheckpointBarrierTracker extends CheckpointBarrierHandler {
             // successful checkpoint for that ID anyways
             if (barrierId > latestPendingCheckpointID) {
                 markAlignmentStart(receivedBarrier.getTimestamp());
-                if(barrierId != ControlMessage.FixedEpochNumber()){
+                if(barrierId != ControlMessage.FixedEpochNumber){
                     latestPendingCheckpointID = barrierId;
                 }
                 pendingCheckpoints.addLast(new CheckpointBarrierCount(barrierId));

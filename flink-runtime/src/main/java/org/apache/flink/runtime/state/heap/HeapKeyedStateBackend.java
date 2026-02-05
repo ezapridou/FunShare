@@ -32,6 +32,7 @@ import org.apache.flink.api.common.typeutils.TypeSerializerSchemaCompatibility;
 import org.apache.flink.api.java.tuple.Tuple2;
 import org.apache.flink.core.fs.CloseableRegistry;
 import org.apache.flink.runtime.checkpoint.CheckpointOptions;
+import org.apache.flink.runtime.clusterframework.types.ResourceID;
 import org.apache.flink.runtime.query.TaskKvStateRegistry;
 import org.apache.flink.runtime.state.AbstractKeyedStateBackend;
 import org.apache.flink.runtime.state.CheckpointStreamFactory;
@@ -64,6 +65,7 @@ import javax.annotation.Nonnull;
 
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.RunnableFuture;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
@@ -407,5 +409,159 @@ public class HeapKeyedStateBackend<K> extends AbstractKeyedStateBackend<K> {
                 StateTable<K, N, SV> stateTable,
                 TypeSerializer<K> keySerializer)
                 throws Exception;
+    }
+
+    /**
+     * This method is used for debugging purposes
+     * @param taskName
+     */
+    public void printState(String taskName) {
+        String res = taskName + " HeapKeyedStateBackend: RegisteredKVStates: ";
+        for (Map.Entry<String, StateTable<K, ?, ?>> entry : registeredKVStates.entrySet()){
+            res += entry.getKey() + " - " + entry.getValue().toStringCustom() + "\n ";
+        }
+        System.out.println(res);
+    }
+
+    public Map<Integer, Map<String, Map<Integer, StateMap<K, ?, ?>>>> getEntriesForMigration(
+            int newDOP, int taskIndex, int maxParallelism,
+            Map<Integer, ResourceID> partitionToResourceIDMap,
+            // resource id-> partition id -> state id -> keygroup id -> state
+            Map<ResourceID, Map<Integer, Map<Integer, Map<Integer, byte[]>>>> stateForOtherTMs,
+            Map<Integer, String> stateNameDict, List<Integer> partitionIdToTaskId) {
+        Map<Integer, Map<String, Map<Integer, StateMap<K, ?, ?>>>> stateToMigrate =
+                new java.util.HashMap<>(newDOP);
+
+        int idx = 0;
+        for (Map.Entry<String, StateTable<K, ?, ?>> KVStates : registeredKVStates.entrySet()) {
+            stateNameDict.put(idx, KVStates.getKey());
+            // per partition to-be-migrated keyGroups of a specific KVState
+            Map<Integer, Map<Integer, StateMap<K, ?, ?>>> keyGroupsToMigrate = KVStates.getValue()
+                    .getEntriesForMigration(newDOP, taskIndex, maxParallelism,
+                            partitionToResourceIDMap, stateForOtherTMs, partitionIdToTaskId, idx);
+            idx++;
+
+            addKeyGroupsToState(keyGroupsToMigrate, stateToMigrate, KVStates.getKey());
+        }
+        return stateToMigrate;
+    }
+
+    public Map<Integer, Map<String, Map<Integer, StateMap<K, ?, ?>>>> getEntireStateForMigration(
+            int newDOP, int taskIndex, int maxParallelism,
+            Map<Integer, ResourceID> partitionToResourceIDMapActive,
+            Map<Integer, ResourceID> partitionToResourceIDMapPassive,
+            Map<ResourceID, Map<Integer, Map<Integer, Map<Integer, byte[]>>>> stateForOtherTMs,
+            Map<Integer, String> stateNameDict, List<Integer> partitionIdToTaskId) {
+        Map<Integer, Map<String, Map<Integer, StateMap<K, ?, ?>>>> stateToMigrate =
+                new java.util.HashMap<>(newDOP);
+
+        int idx = 0;
+        for (Map.Entry<String, StateTable<K, ?, ?>> KVStates : registeredKVStates.entrySet()) {
+            stateNameDict.put(idx, KVStates.getKey());
+            // per partition to-be-migrated keyGroups of a specific KVState
+            Map<Integer, Map<Integer, StateMap<K, ?, ?>>> keyGroupsToMigrate = KVStates.getValue()
+                    .getEntireStateForMigration(newDOP, taskIndex, maxParallelism,
+                            partitionToResourceIDMapActive, partitionToResourceIDMapPassive,
+                            stateForOtherTMs, partitionIdToTaskId, idx);
+
+            addKeyGroupsToState(keyGroupsToMigrate, stateToMigrate, KVStates.getKey());
+        }
+        return stateToMigrate;
+    }
+
+    public Map<Integer, Map<String, Map<Integer, StateMap<K, ?, ?>>>> getEntriesInRangeForMigration(
+            int newDOP, int taskIndex, int maxParallelism, long start, long end, long start2, long end2,
+            Map<Integer, ResourceID> partitionToResourceIDMapActive,
+            Map<Integer, ResourceID> partitionToResourceIDMapPassive,
+            Map<ResourceID, Map<Integer, Map<Integer, Map<Integer, byte[]>>>> stateForOtherTMs,
+            Map<Integer, String> stateNameDict, List<Integer> partitionIdToTaskId) {
+        Map<Integer, Map<String, Map<Integer, StateMap<K, ?, ?>>>> stateToMigrate =
+                new java.util.HashMap<>(newDOP);
+
+        int idx = 0;
+        for (Map.Entry<String, StateTable<K, ?, ?>> KVStates : registeredKVStates.entrySet()) {
+            stateNameDict.put(idx, KVStates.getKey());
+            // per partition to-be-migrated keyGroups of a specific KVState
+            Map<Integer, Map<Integer, StateMap<K, ?, ?>>> keyGroupsToMigrate = KVStates.getValue()
+                    .getEntriesInRangeForMigration(newDOP, taskIndex, maxParallelism, start, end,
+                            start2, end2, partitionToResourceIDMapActive,
+                            partitionToResourceIDMapPassive, stateForOtherTMs, partitionIdToTaskId, idx);
+
+            addKeyGroupsToState(keyGroupsToMigrate, stateToMigrate, KVStates.getKey());
+        }
+        return stateToMigrate;
+    }
+
+    public Map<String, StateMap<K, ?, ?>[]> getEntriesForMigrationDownstream(
+            boolean stateMustBeSerialized, Map<String, byte[][]> stateForOtherTM
+            ) {
+        Map<String, StateMap<K, ?, ?>[]> stateToMigrate = new java.util.HashMap<>(registeredKVStates.size());
+        for (Map.Entry<String, StateTable<K, ?, ?>> KVStates : registeredKVStates.entrySet()) {
+            StateMap<K, ?, ?>[] state = KVStates.getValue()
+                    .getEntriesForMigrationDownstream(stateMustBeSerialized, stateForOtherTM, KVStates.getKey());
+            if (stateToMigrate != null) {
+                stateToMigrate.put(KVStates.getKey(), state);
+            }
+        }
+        return stateToMigrate;
+    }
+
+    public void incorporateReceivedState(Map<String, Map<Integer, StateMap<K, ?, ?>>> newStateMaps,
+                                         Map<String, Map<Integer, StateMap<K, ?, ?>>> newStateMapsPassiveQuery,
+                                         int newDOP, int operatorIndex) {
+        for (Map.Entry<String, StateTable<K, ?, ?>> KVStates : registeredKVStates.entrySet()) {
+            Map<Integer, StateMap<K, ?, ?>> stateOfPassiveQuery = newStateMapsPassiveQuery == null ?
+                    null : newStateMapsPassiveQuery.get(KVStates.getKey());
+            Map<Integer, StateMap<K, ?, ?>> newKVState = newStateMaps == null ?
+                    null : newStateMaps.get(KVStates.getKey());
+            KVStates.getValue().incorporateReceivedState(
+                    newKVState, stateOfPassiveQuery,
+                    newDOP, operatorIndex);
+        }
+    }
+
+    public void incorporateReceivedState(Map<String, StateMap<K, ?, ?>[]> newStateMaps) {
+        for (Map.Entry<String, StateTable<K, ?, ?>> KVStates : registeredKVStates.entrySet()) {
+            KVStates.getValue().incorporateReceivedState(newStateMaps.get(KVStates.getKey()));
+        }
+    }
+
+    public void incorporateReceivedSerializedState(
+            Map<Integer, Map<Integer, byte[]>> newState,
+            Map<Integer, Map<Integer, byte[]>> statePassiveQuery,
+            Map<Integer, String> stateNameDict) {
+        for (Map.Entry<Integer, String> stateName : stateNameDict.entrySet()) {
+            if (!registeredKVStates.containsKey(stateName.getValue())){
+                throw new RuntimeException("State " + stateName.getValue() + " not found in registeredKVStates");
+            }
+            Map<Integer, byte[]> newStateWithName = newState == null ? null : newState.get(stateName.getKey());
+            Map<Integer, byte[]> statePassiveWithName = statePassiveQuery == null ? null : statePassiveQuery.get(stateName.getKey());
+            registeredKVStates.get(stateName.getValue()).incorporateReceivedSerializedState(
+                    newStateWithName, statePassiveWithName);
+        }
+    }
+
+    public void incorporateReceivedSerializedStateDownstream(Map<String, byte[][]> newState) {
+        for (Map.Entry<String, StateTable<K, ?, ?>> KVStates : registeredKVStates.entrySet()) {
+            KVStates.getValue().incorporateReceivedSerializedStateDownstream(newState.get(KVStates.getKey()));
+        }
+    }
+
+    private void addKeyGroupsToState(Map<Integer, Map<Integer, StateMap<K, ?, ?>>> keyGroupsToMigrate,
+                                     Map<Integer, Map<String, Map<Integer, StateMap<K, ?, ?>>>> stateToMigrate,
+                                     String KVStateKey) {
+        // iterate over the partitions
+        for (Map.Entry<Integer, Map<Integer, StateMap<K, ?, ?>>> statePerPartition :
+                keyGroupsToMigrate.entrySet()) {
+
+            // get/create an entry for the partition in the stateToMigrate map
+            Map<String, Map<Integer, StateMap<K, ?, ?>>> KVStatesOfPartition =
+                    stateToMigrate.computeIfAbsent(
+                            statePerPartition.getKey(),
+                            x -> new java.util.HashMap<>());
+
+            // add the stateMaps of the specific KVState to the partition
+            KVStatesOfPartition.put(KVStateKey, statePerPartition.getValue());
+        }
     }
 }

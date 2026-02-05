@@ -32,10 +32,15 @@ import org.apache.flink.streaming.runtime.io.checkpointing.CheckpointedInputGate
 import org.apache.flink.streaming.runtime.streamrecord.StreamElement;
 import org.apache.flink.streaming.runtime.streamrecord.StreamElementSerializer;
 import org.apache.flink.streaming.runtime.streamstatus.StatusWatermarkValve;
+import org.apache.flink.streaming.runtime.streamstatus.StreamStatus;
 
+import org.apache.hadoop.yarn.webapp.hamlet.Hamlet;
+
+import java.io.DataOutput;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
@@ -127,6 +132,27 @@ public abstract class AbstractStreamTaskNetworkInput<
                     return InputStatus.END_OF_INPUT;
                 }
                 return InputStatus.NOTHING_AVAILABLE;
+            }
+        }
+    }
+
+    public void changeChannelsState(List<Integer> activeChannels, DataOutput<T> output) throws Exception {
+        for (Map.Entry<InputChannelInfo, Integer> entry : flattenedChannelIndices.entrySet()) {
+            /*System.out.println("Key = inputChannelIdx" + entry.getKey().inputChannelIdx
+                    + ", fromPartition = " + entry.getKey().fromPartition.getPartitionId().getPartitionNumber()
+                    + ", gateIdx = " + entry.getKey().gateIdx
+                    + ", Value = " + entry.getValue());*/
+            if (activeChannels.contains(entry.getKey().inputChannelIdx)) {
+                statusWatermarkValve.inputStreamStatus(
+                        StreamStatus.ACTIVE,
+                        entry.getValue(),
+                        output);
+            }
+            else {
+                statusWatermarkValve.inputStreamStatus(
+                        StreamStatus.IDLE,
+                        entry.getValue(),
+                        output);
             }
         }
     }

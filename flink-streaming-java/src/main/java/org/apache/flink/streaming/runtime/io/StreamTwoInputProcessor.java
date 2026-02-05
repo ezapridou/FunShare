@@ -28,6 +28,7 @@ import org.apache.flink.streaming.runtime.tasks.TwoInputStreamTask;
 import org.apache.flink.util.ExceptionUtils;
 
 import java.io.IOException;
+import java.util.List;
 import java.util.concurrent.CompletableFuture;
 
 /**
@@ -161,6 +162,19 @@ public final class StreamTwoInputProcessor<IN1, IN2> implements StreamInputProce
         if (ex != null) {
             throw ex;
         }
+    }
+
+    @Override
+    public String printClass() {
+        String res = "StreamTwoInputProcessor";
+        res += ": " + getInput(0).printClass();
+        res += ", " + getInput(1).printClass();
+        return res;
+    }
+
+    public void changeChannelsState(List<Integer> activeChannels) throws Exception {
+        getInput(0).changeChannelsState(activeChannels);
+        getInput(1).changeChannelsState(activeChannels);
     }
 
     private int selectNextReadingInputIndex() throws IOException {

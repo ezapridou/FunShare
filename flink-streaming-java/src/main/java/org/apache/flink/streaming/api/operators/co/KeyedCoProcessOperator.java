@@ -18,8 +18,11 @@
 package org.apache.flink.streaming.api.operators.co;
 
 import org.apache.flink.annotation.Internal;
+import org.apache.flink.api.common.typeutils.TypeSerializer;
+import org.apache.flink.runtime.clusterframework.types.ResourceID;
 import org.apache.flink.runtime.state.VoidNamespace;
 import org.apache.flink.runtime.state.VoidNamespaceSerializer;
+import org.apache.flink.runtime.state.heap.HeapPriorityQueueElement;
 import org.apache.flink.streaming.api.SimpleTimerService;
 import org.apache.flink.streaming.api.TimeDomain;
 import org.apache.flink.streaming.api.TimerService;
@@ -27,11 +30,16 @@ import org.apache.flink.streaming.api.functions.co.KeyedCoProcessFunction;
 import org.apache.flink.streaming.api.operators.AbstractUdfStreamOperator;
 import org.apache.flink.streaming.api.operators.InternalTimer;
 import org.apache.flink.streaming.api.operators.InternalTimerService;
+import org.apache.flink.streaming.api.operators.InternalTimerServiceImpl;
 import org.apache.flink.streaming.api.operators.TimestampedCollector;
 import org.apache.flink.streaming.api.operators.Triggerable;
 import org.apache.flink.streaming.api.operators.TwoInputStreamOperator;
 import org.apache.flink.streaming.runtime.streamrecord.StreamRecord;
 import org.apache.flink.util.OutputTag;
+
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
 
 import static org.apache.flink.util.Preconditions.checkNotNull;
 import static org.apache.flink.util.Preconditions.checkState;
@@ -105,6 +113,18 @@ public class KeyedCoProcessOperator<K, IN1, IN2, OUT>
         userFunction.onTimer(timer.getTimestamp(), onTimerContext, collector);
         onTimerContext.timeDomain = null;
         onTimerContext.timer = null;
+    }
+
+    public InternalTimerServiceImpl getInternalTimerService() {
+        if (!(context.timerService() instanceof SimpleTimerService) ||
+            !(((SimpleTimerService) context.timerService()).getInternalTimerService() instanceof InternalTimerServiceImpl)) {
+            throw new UnsupportedOperationException(
+                    "InternalTimerService is not an instance of InternalTimerServiceImpl "
+                            + "and does not support state migration.");
+        }
+        else {
+            return (InternalTimerServiceImpl)(((SimpleTimerService) context.timerService()).getInternalTimerService());
+        }
     }
 
     protected TimestampedCollector<OUT> getCollector() {

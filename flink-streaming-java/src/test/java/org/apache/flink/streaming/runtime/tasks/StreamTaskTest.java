@@ -1885,6 +1885,11 @@ public class StreamTaskTest extends TestLogger {
         public CompletableFuture<?> getAvailableFuture() {
             return AVAILABLE;
         }
+
+        @Override
+        public String printClass() {
+            throw new UnsupportedOperationException("Not implemented");
+        }
     }
 
     /**
@@ -1914,6 +1919,11 @@ public class StreamTaskTest extends TestLogger {
         @Override
         public CompletableFuture<?> getAvailableFuture() {
             return availabilityProvider.getAvailableFuture();
+        }
+
+        @Override
+        public String printClass() {
+            throw new UnsupportedOperationException("Not implemented");
         }
     }
 
@@ -2108,6 +2118,11 @@ public class StreamTaskTest extends TestLogger {
 
         public void finishInput() {
             isFinished = true;
+        }
+
+        @Override
+        public String printClass() {
+            throw new UnsupportedOperationException("Not implemented");
         }
     }
 
@@ -2725,6 +2740,11 @@ public class StreamTaskTest extends TestLogger {
 
                 @Override
                 public void close() {}
+
+                @Override
+                public String printClass() {
+                    throw new UnsupportedOperationException("Not implemented");
+                }
             };
         }
     }

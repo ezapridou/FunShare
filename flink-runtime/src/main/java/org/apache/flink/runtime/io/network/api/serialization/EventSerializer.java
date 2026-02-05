@@ -18,7 +18,7 @@
 
 package org.apache.flink.runtime.io.network.api.serialization;
 
-import org.apache.flink.runtime.controller.ControlMessage;
+import org.apache.flink.extensions.controller.ControlMessage;
 
 import org.apache.flink.core.memory.DataInputDeserializer;
 import org.apache.flink.core.memory.DataOutputSerializer;
@@ -291,8 +291,12 @@ public class EventSerializer {
         if(len > 1){
             byte[] bytes = new byte[len];
             buffer.get(bytes);
-            ControlMessage message = ControlMessage.deserialize(bytes);
-            barrier.setMessage(message);
+            try {
+                ControlMessage message = ControlMessage.deserialize(bytes);
+                barrier.setMessage(message);
+            } catch (ClassNotFoundException e) {
+                throw new IOException("Error while deserializing control message", e);
+            }
         }
         return barrier;
     }

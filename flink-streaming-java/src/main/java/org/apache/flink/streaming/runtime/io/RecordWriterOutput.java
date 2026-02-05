@@ -22,6 +22,7 @@ import org.apache.flink.api.common.typeutils.TypeSerializer;
 import org.apache.flink.metrics.Gauge;
 import org.apache.flink.runtime.event.AbstractEvent;
 import org.apache.flink.runtime.io.network.api.CheckpointBarrier;
+import org.apache.flink.runtime.io.network.api.writer.ChannelSelectorRecordWriter;
 import org.apache.flink.runtime.io.network.api.writer.RecordWriter;
 import org.apache.flink.runtime.plugable.SerializationDelegate;
 import org.apache.flink.streaming.api.operators.Output;
@@ -186,5 +187,28 @@ public class RecordWriterOutput<OUT> implements WatermarkGaugeExposingOutput<Str
     @Override
     public Gauge<Long> getWatermarkGauge() {
         return watermarkGauge;
+    }
+
+    /**
+     * This method is used for debugging purposes
+     * @return
+     */
+    public String getRecordWriterClass() {
+        String classStr = recordWriter.getClass().getName();
+        if (recordWriter instanceof ChannelSelectorRecordWriter) {
+            classStr += " - " + ((ChannelSelectorRecordWriter) recordWriter).getChannelSelectorClass();
+        }
+        else {
+            classStr += " - not a ChannelSelectorRecordWriter";
+        }
+        return classStr;
+    }
+
+    public boolean hasForwardPartitioner() {
+        if (recordWriter instanceof ChannelSelectorRecordWriter) {
+            return ((ChannelSelectorRecordWriter) recordWriter).hasForwardPartitioner();
+        } else {
+            return false;
+        }
     }
 }

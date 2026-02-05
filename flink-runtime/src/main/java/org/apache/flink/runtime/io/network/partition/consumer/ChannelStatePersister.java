@@ -17,7 +17,7 @@
 
 package org.apache.flink.runtime.io.network.partition.consumer;
 
-import org.apache.flink.runtime.controller.ControlMessage;
+import org.apache.flink.extensions.controller.ControlMessage;
 
 import org.apache.flink.runtime.checkpoint.CheckpointException;
 import org.apache.flink.runtime.checkpoint.CheckpointFailureReason;
@@ -123,7 +123,7 @@ public final class ChannelStatePersister {
         AbstractEvent event = parseEvent(buffer);
         if (event instanceof CheckpointBarrier) {
             long barrierId = ((CheckpointBarrier) event).getId();
-            if(barrierId == ControlMessage.FixedEpochNumber()){
+            if(barrierId == ControlMessage.FixedEpochNumber){
                 return Optional.empty();
             }
             long expectedBarrierId =

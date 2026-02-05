@@ -265,4 +265,10 @@ public class OutputEmitter<T> implements ChannelSelector<SerializationDelegate<T
         }
         return 0;
     }
+
+    @Override
+    public void setNumberOfChannels(int numberOfChannels) {
+        throw new UnsupportedOperationException(
+                "OutputEmitter does not support setNumberOfChannels");
+    }
 }

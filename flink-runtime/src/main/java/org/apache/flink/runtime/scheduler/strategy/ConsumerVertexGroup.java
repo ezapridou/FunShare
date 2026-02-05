@@ -19,6 +19,7 @@
 package org.apache.flink.runtime.scheduler.strategy;
 
 import org.apache.flink.runtime.executiongraph.ExecutionVertex;
+import org.apache.flink.extensions.reconfiguration.IConsumerVertexGroup;
 
 import java.util.Arrays;
 import java.util.Collections;
@@ -27,7 +28,7 @@ import java.util.List;
 import java.util.stream.Collectors;
 
 /** Group of consumer {@link ExecutionVertexID}s. */
-public class ConsumerVertexGroup implements Iterable<ExecutionVertexID> {
+public class ConsumerVertexGroup implements Iterable<ExecutionVertexID>, IConsumerVertexGroup {
     private final List<ExecutionVertexID> vertices;
     private final List<String> workerNames;
 

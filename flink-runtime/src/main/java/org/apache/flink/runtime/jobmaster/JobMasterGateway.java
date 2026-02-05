@@ -18,6 +18,8 @@
 
 package org.apache.flink.runtime.jobmaster;
 
+import net.michaelkoepf.spegauge.api.sut.ReconfigurableSourceData;
+
 import org.apache.flink.api.common.JobID;
 import org.apache.flink.api.common.JobStatus;
 import org.apache.flink.api.common.functions.AggregateFunction;
@@ -44,6 +46,7 @@ import org.apache.flink.runtime.rpc.FencedRpcGateway;
 import org.apache.flink.runtime.rpc.RpcTimeout;
 import org.apache.flink.runtime.scheduler.ExecutionGraphInfo;
 import org.apache.flink.runtime.slots.ResourceRequirement;
+import org.apache.flink.runtime.state.heap.StateMap;
 import org.apache.flink.runtime.taskexecutor.TaskExecutorToJobManagerHeartbeatPayload;
 import org.apache.flink.runtime.taskexecutor.slot.SlotOffer;
 import org.apache.flink.runtime.taskmanager.TaskExecutionState;
@@ -53,6 +56,10 @@ import org.apache.flink.util.SerializedValue;
 import javax.annotation.Nullable;
 
 import java.util.Collection;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 
 /** {@link JobMaster} rpc gateway interface. */
@@ -294,4 +301,44 @@ public interface JobMasterGateway
             OperatorID operatorId,
             SerializedValue<CoordinationRequest> serializedRequest,
             @RpcTimeout Time timeout);
+
+    /**
+     * Sends state to the JobMaster. This state must be sent to a TaskManager.
+     */
+    void sendStateToJobMaster(Map<ResourceID, Map<Integer, Map<Integer, Map<Integer, byte[]>>>> newState,
+                              Map<ResourceID, Map<Integer, Map<Integer, HashMap<byte[], byte[]>>>> newDedupMaps,
+                              Map<ResourceID, Map<Integer, List<byte[]>>> newTriggers,
+                              Map<ResourceID, Map<Integer, Map<Integer, Map<Integer, byte[]>>>> statePassiveQuery,
+                              Map<Integer, String> stateNames,
+                              int numOfSenderTMs, int activeGroupId);
+
+    void sendStateOnlyToJobMaster(
+            Map<ResourceID, Map<Integer, Map<Integer, Map<Integer, byte[]>>>> state,
+            Map<Integer, String> stateNames,
+            int numOfSenderTMs, int activeGroupId);
+
+    void sendDedupMapsToJobMaster(
+            Map<ResourceID, Map<Integer, Map<Integer, HashMap<byte[], byte[]>>>> deduplicationMaps,
+            int numOfSenderTMs, int activeGroupId);
+
+    void sendTriggersToJobMaster(
+            Map<ResourceID, Map<Integer, List<byte[]>>> triggers,
+            int numOfSenderTMs, int activeGroupId);
+
+    void sendStatePassiveToJobMaster(
+            Map<ResourceID, Map<Integer, Map<Integer, Map<Integer, byte[]>>>> state,
+            Map<Integer, String> stateNames,
+            int numOfSenderTMs, int activeGroupId);
+
+    void sendStateToJobMasterDownstream(Map<ResourceID, Map<Integer, Map<String, byte[][]>>> state,
+                                        Map<ResourceID, Map<Integer, HashMap<byte[], byte[]>[]>> deduplicationMaps,
+                                        Map<ResourceID, Map<Integer, byte[][]>> triggers,
+                                        Map<ResourceID, Map<Integer, Integer>> queueSizes,
+                                        int numOfSenderTMs, int activeGroupId);
+
+    void sendLastTupleDataToJobMaster(Map<Integer, ReconfigurableSourceData> lastTupleData,
+                                      int numOfSenderTMs, ResourceID taskManagerId, int activeGroupId);
+
+    void sendNewDriverInfoAndResourceIDToJobMaster(String hostOfNewDriver, int portOfNewDriver,
+                                                   Set<ResourceID> taskManagerIDs, int activeGroupId);
 }
