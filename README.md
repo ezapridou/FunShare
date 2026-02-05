@@ -41,7 +41,7 @@ We modified the following directories to enable FunShare:
 - flink-extensions: contains the implementation of the optimizer
 - flink-runtime and flink.contrib.streaming.state: contain modifications to enable dynamic reconfiguration and operator sharing
 
-(We will be soon updating the repository such that the modifications can be easily detected via the commit history)
+(See the commit history for a full list of updates)
 
 ## Application-level code and data generator
 Repository for the application-level code (queries) and the data-generator: [SPEGauge](https://github.com/michaelkoepf/SPEGauge)
