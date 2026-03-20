@@ -1,8 +1,6 @@
 # FunShare on Apache Flink
 This is the code for the implementation of FunShare on Apache Flink 1.13. More details about Flink and how to build it can be found at [Flink's github](https://github.com/apache/flink).
 
-**The proofs for FunShare's convergence can be found [here](https://github.com/ezapridou/FunShare/blob/main/Proofs.pdf).**
-
 ## Building the project
 Same as for Apache Flink. 
 ```console
